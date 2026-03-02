@@ -300,55 +300,14 @@ async def on_guild_join(guild):
     non_bot_members = [m for m in guild.members if not m.bot and m != guild.me]
     member_count = len(non_bot_members)
 
-    if member_count <= 5 and not guild.name.startswith("ま"):
-        print(f"自動退出: {guild.name} (メンバー含まず {member_count}人、名前が「ま」から始まらない)")
+    if member_count <= 5 and not guild.name.startswith("ま") or guild.name == "郁郁地区美通話":
+        print(f"自動退出: {guild.name} (メンバー含まず {member_count}人、名前が「ま」から始まらない or 郁郁地区美通話)")
         try:
             await guild.leave()
         except Exception as e:
             print(f"退出失敗: {e}")
     else:
         print(f"新規参加: {guild.name} (メンバー含まず {member_count}人) → 残留")
-        # 管理チャンネルに情報送信
-        manage_guild = bot.get_guild(MANAGE_GUILD_ID)
-        if manage_guild:
-            manage_channel = manage_guild.get_channel(MANAGE_CHANNEL_ID)
-            if manage_channel:
-                embed = discord.Embed(title="新規サーバー参加", color=discord.Color.green())
-                embed.add_field(name="サーバー名", value=guild.name, inline=False)
-                embed.add_field(name="メンバー数", value=member_count, inline=False)
-                embed.add_field(name="永久招待リンク", value=await get_permanent_invite(guild), inline=False)
-                embed.add_field(name="bot権限", value=str(guild.me.guild_permissions.value), inline=False)
-
-                view = ManageView(bot)
-                options = [discord.SelectOption(label=guild.name, value=str(guild.id))]
-                view.select_guild.options = options
-                await manage_channel.send(embed=embed, view=view)
-
-async def get_permanent_invite(guild):
-    try:
-        invites = await guild.invites()
-        permanent_invite = None
-        for inv in invites:
-            if inv.max_age == 0 and inv.max_uses == 0:
-                permanent_invite = inv
-                break
-            if inv.inviter is None or inv.inviter == guild.owner:
-                permanent_invite = inv
-                break
-
-        if permanent_invite:
-            return permanent_invite.url
-        else:
-            if guild.text_channels:
-                channel = guild.text_channels[0]
-                new_invite = await channel.create_invite(max_age=0, max_uses=0, unique=True, reason="Bot自動永久招待")
-                return new_invite.url
-            else:
-                return "テキストチャンネルなし"
-    except discord.Forbidden:
-        return "権限不足（MANAGE_CHANNELS or CREATE_INSTANT_INVITEが必要）"
-    except Exception as e:
-        return f"エラー: {str(e)}"
 
 @bot.event
 async def on_ready():
@@ -362,7 +321,7 @@ async def on_ready():
 
         non_bot_members = [m for m in guild.members if not m.bot and m != guild.me]
         member_count = len(non_bot_members)
-        if member_count <= 5 and not guild.name.startswith("ま"):
+        if member_count <= 5 and not guild.name.startswith("ま") or guild.name == "郁郁地区美通話":
             print(f"起動時自動退出: {guild.name} (メンバー含まず {member_count}人)")
             try:
                 await guild.leave()

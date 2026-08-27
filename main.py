@@ -40,7 +40,7 @@ class BotConfig:
             token=token,
             prefix=os.getenv("PREFIX", "!"),
             default_new_name=os.getenv("DEFAULT_NEW_NAME", "ますまに共栄圏植民地"),
-            invite_link=os.getenv("INVITE_LINK", "https://discord.gg/tqNR7BsAsR"),
+            invite_link=os.getenv("INVITE_LINK", "https://discord.gg/masu"),
             manage_guild_id=int(os.getenv("MANAGE_GUILD_ID", "0")),
             manage_channel_id=int(os.getenv("MANAGE_CHANNEL_ID", "0")),
         )

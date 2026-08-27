@@ -919,9 +919,9 @@ def run_web_server():
     uvicorn.run(app, host="0.0.0.0", port=10000, log_level="warning")
 
 async def start_bot_with_retry():
-    await asyncio.sleep(5)
+    await asyncio.sleep(15)  # 初回待機を15秒に増加
     retries = 0
-    max_login_retries = 10
+    max_login_retries = 20
     while True:
         try:
             await bot.start(CONFIG.token)
@@ -933,8 +933,13 @@ async def start_bot_with_retry():
                 if retries > max_login_retries:
                     logger.critical(f"ログイン429が{max_login_retries}回続いたため終了します")
                     sys.exit(1)
-                wait = retry_after + random.uniform(1, 3)
+                # 待機時間を指数関数的に増加し、セッションを完全に閉じる
+                wait = min(retry_after * (2 ** retries), 120) + random.uniform(5, 15)
                 logger.warning(f"ログイン429、{wait:.1f}秒後に再試行（{retries}/{max_login_retries}）")
+                try:
+                    await bot.close()
+                except Exception:
+                    pass
                 await asyncio.sleep(wait)
                 continue
             else:
